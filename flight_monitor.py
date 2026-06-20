@@ -107,6 +107,8 @@ def search_cheapest(token: str, route: dict) -> float | None:
         "destinationLocationCode": route["destination"],
         "departureDate": route["departure_date"],
         "adults": route.get("adults", 1),
+        "nonStop": str(route.get("non_stop", True)).lower(),
+        "travelClass": route.get("travel_class", "ECONOMY"),
         "currencyCode": CURRENCY,
         "max": 1,
     }
