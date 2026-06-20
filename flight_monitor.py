@@ -4,7 +4,8 @@
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -18,11 +19,12 @@ AMADEUS_CLIENT_SECRET = os.environ.get("AMADEUS_CLIENT_SECRET", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CURRENCY = os.environ.get("CURRENCY", "USD")
-TIMEZONE = os.environ.get("TIMEZONE", "UTC")
+TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 ACTIVE_START = int(os.environ.get("ACTIVE_START", "7"))
 ACTIVE_END = int(os.environ.get("ACTIVE_END", "22"))
 ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3"))
 MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "1900"))
+MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "1000"))
 
 AMADEUS_BASE = "https://api.amadeus.com"
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -41,8 +43,14 @@ def load_json(path: Path) -> dict:
 
 
 def save_json(path: Path, data: dict) -> None:
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
 
 
 def current_local_time() -> datetime:
@@ -140,11 +148,14 @@ def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"  [Telegram disabled] {message}")
         return
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
-        timeout=15,
-    )
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
+            timeout=15,
+        )
+    except requests.RequestException as e:
+        print(f"  [Telegram error] {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +207,8 @@ def main() -> None:
         prev = prices.get(label, {}).get("price")
         history = prices.get(label, {}).get("history", [])
         history.append({"price": price, "timestamp": now_str})
+        if len(history) > MAX_HISTORY:
+            history = history[-MAX_HISTORY:]
         prices[label] = {"price": price, "updated": now_str, "history": history}
         print(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else ""))
 
