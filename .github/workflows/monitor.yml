@@ -1,0 +1,47 @@
+name: Flight Price Monitor
+
+on:
+  schedule:
+    - cron: "0 * * * *" # Every hour
+  workflow_dispatch: # Allow manual triggers
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flight monitor
+        env:
+          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
+          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CURRENCY: ${{ vars.CURRENCY || 'USD' }}
+          TIMEZONE: ${{ vars.TIMEZONE || 'America/New_York' }}
+          ACTIVE_START: ${{ vars.ACTIVE_START || '7' }}
+          ACTIVE_END: ${{ vars.ACTIVE_END || '22' }}
+          ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT || '3' }}
+          MONTHLY_CALL_CAP: ${{ vars.MONTHLY_CALL_CAP || '1900' }}
+        run: python flight_monitor.py
+
+      - name: Commit state.json
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || git commit -m "Update state.json [skip ci]"
+          git push
