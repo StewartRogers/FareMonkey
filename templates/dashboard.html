@@ -83,7 +83,7 @@
           <div style="font-size:0.8rem;color:#94a3b8;margin-top:0.25rem;">{{ route.checks }} check{{ 's' if route.checks != 1 else '' }} recorded</div>
         </div>
         <div style="text-align:right">
-          <div class="route-price">{{ currency }} {{ "%.2f"|format(route.current_price) }}</div>
+          <div class="route-price">{% if route.current_price is not none %}{{ currency }} {{ "%.2f"|format(route.current_price) }}{% else %}—{% endif %}</div>
           {% if route.pct_change is not none %}
             {% if route.pct_change < 0 %}
               <span class="badge badge-down">{{ route.pct_change }}%</span>

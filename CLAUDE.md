@@ -71,7 +71,7 @@ All configuration is read from environment variables (no hardcoded credentials):
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram bot token (alerts disabled if unset) |
 | `TELEGRAM_CHAT_ID` | No | - | Telegram chat ID |
 | `CURRENCY` | No | `USD` | Currency for price queries |
-| `TIMEZONE` | No | `UTC` | IANA timezone for active-hours check |
+| `TIMEZONE` | No | `America/New_York` | IANA timezone for active-hours check |
 | `ACTIVE_START` | No | `7` | Start of active window (hour, local time) |
 | `ACTIVE_END` | No | `22` | End of active window (hour, local time) |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |

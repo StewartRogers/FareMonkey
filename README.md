@@ -35,7 +35,7 @@ Edit `routes.json` with the flights you want to track:
 ]
 ```
 
-Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. `return_date` and `adults` are optional (defaults to one-way, 1 adult).
+Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`).
 
 ### 3. Install and configure
 
@@ -66,8 +66,6 @@ crontab -e
 # Add this line (adjust the path):
 0 * * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
 ```
-
-Or use the included systemd timer (see `faremonkey.service` and `faremonkey.timer`).
 
 ### 6. GitHub Actions (alternative to local cron)
 
@@ -102,7 +100,7 @@ The workflow runs automatically every hour and commits `state.json` back.
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram bot token (alerts disabled if unset) |
 | `TELEGRAM_CHAT_ID` | No | - | Telegram chat ID |
 | `CURRENCY` | No | `USD` | Currency for price queries |
-| `TIMEZONE` | No | `UTC` | IANA timezone for active-hours check |
+| `TIMEZONE` | No | `America/New_York` | IANA timezone for active-hours check |
 | `ACTIVE_START` | No | `7` | Start of active window (hour) |
 | `ACTIVE_END` | No | `22` | End of active window (hour) |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
