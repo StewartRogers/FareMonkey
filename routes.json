@@ -1,0 +1,15 @@
+[
+  {
+    "origin": "JFK",
+    "destination": "LHR",
+    "departure_date": "2026-09-15",
+    "return_date": "2026-09-22",
+    "adults": 1
+  },
+  {
+    "origin": "LAX",
+    "destination": "NRT",
+    "departure_date": "2026-10-01",
+    "adults": 1
+  }
+]
