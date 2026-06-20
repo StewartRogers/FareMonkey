@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FareMonkey</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .container { max-width: 1200px; margin: 0 auto; padding: 2rem 1rem; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
+    h1 { font-size: 1.8rem; color: #f8fafc; }
+    h1 span { color: #38bdf8; }
+    .meta { font-size: 0.85rem; color: #94a3b8; text-align: right; }
+
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+    .stat-card { background: #1e293b; border-radius: 12px; padding: 1.25rem; }
+    .stat-card .label { font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat-card .value { font-size: 1.6rem; font-weight: 700; margin-top: 0.25rem; }
+
+    .route-card { background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+    .route-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; flex-wrap: wrap; gap: 0.5rem; }
+    .route-label { font-size: 1.2rem; font-weight: 600; }
+    .route-price { font-size: 1.4rem; font-weight: 700; }
+    .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.8rem; font-weight: 600; }
+    .badge-down { background: #064e3b; color: #34d399; }
+    .badge-up { background: #7f1d1d; color: #fca5a5; }
+    .badge-neutral { background: #1e3a5f; color: #93c5fd; }
+    .chart-wrap { height: 250px; margin-top: 1rem; }
+
+    .empty { text-align: center; padding: 4rem 1rem; color: #64748b; }
+    .empty p { margin-top: 0.5rem; font-size: 0.95rem; }
+
+    .api-table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+    .api-table th, .api-table td { text-align: left; padding: 0.4rem 0.75rem; font-size: 0.85rem; }
+    .api-table th { color: #94a3b8; border-bottom: 1px solid #334155; }
+    .api-table td { color: #cbd5e1; }
+    .bar-bg { background: #334155; border-radius: 4px; height: 8px; width: 100%; }
+    .bar-fill { background: #38bdf8; border-radius: 4px; height: 8px; }
+    .bar-warn { background: #f59e0b; }
+    .bar-danger { background: #ef4444; }
+
+    footer { text-align: center; margin-top: 3rem; font-size: 0.8rem; color: #475569; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1><span>Fare</span>Monkey</h1>
+      <div class="meta">
+        {% if last_run %}Last check: {{ last_run[:19] }}{% else %}No checks yet{% endif %}
+      </div>
+    </header>
+
+    <div class="stats">
+      <div class="stat-card">
+        <div class="label">Routes tracked</div>
+        <div class="value">{{ routes|length }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="label">API calls this period</div>
+        <div class="value">{{ total_calls }} <span style="font-size:0.8rem;color:#94a3b8">/ {{ monthly_cap }}</span></div>
+      </div>
+      <div class="stat-card">
+        <div class="label">Currency</div>
+        <div class="value">{{ currency }}</div>
+      </div>
+    </div>
+
+    {% if not routes %}
+    <div class="empty">
+      <h2>No price data yet</h2>
+      <p>Run <code>python flight_monitor.py</code> to start collecting prices.</p>
+    </div>
+    {% endif %}
+
+    {% for route in routes %}
+    <div class="route-card">
+      <div class="route-header">
+        <div>
+          <div class="route-label">{{ route.label }}</div>
+          <div style="font-size:0.8rem;color:#94a3b8;margin-top:0.25rem;">{{ route.checks }} check{{ 's' if route.checks != 1 else '' }} recorded</div>
+        </div>
+        <div style="text-align:right">
+          <div class="route-price">{% if route.current_price is not none %}{{ currency }} {{ "%.2f"|format(route.current_price) }}{% else %}—{% endif %}</div>
+          {% if route.pct_change is not none %}
+            {% if route.pct_change < 0 %}
+              <span class="badge badge-down">{{ route.pct_change }}%</span>
+            {% elif route.pct_change > 0 %}
+              <span class="badge badge-up">+{{ route.pct_change }}%</span>
+            {% else %}
+              <span class="badge badge-neutral">0%</span>
+            {% endif %}
+          {% endif %}
+        </div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="chart-{{ loop.index }}"></canvas>
+      </div>
+    </div>
+    {% endfor %}
+
+    {% if api_calls %}
+    <div class="route-card">
+      <div class="route-label" style="margin-bottom:0.75rem">API Usage</div>
+      <table class="api-table">
+        <tr><th>Month</th><th>Calls</th><th></th></tr>
+        {% for month, count in api_calls.items()|sort(reverse=true) %}
+        <tr>
+          <td>{{ month }}</td>
+          <td>{{ count }}</td>
+          <td style="width:50%">
+            <div class="bar-bg">
+              {% set pct = (count / monthly_cap * 100)|int %}
+              <div class="bar-fill {% if pct > 90 %}bar-danger{% elif pct > 70 %}bar-warn{% endif %}" style="width:{{ [pct, 100]|min }}%"></div>
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </table>
+    </div>
+    {% endif %}
+
+    <footer>FareMonkey &middot; Flight price monitor</footer>
+  </div>
+
+  <script>
+    const routeData = {{ routes|tojson }};
+    routeData.forEach((route, i) => {
+      const ctx = document.getElementById('chart-' + (i + 1));
+      if (!ctx || route.prices.length === 0) return;
+
+      const labels = route.timestamps.map(t => {
+        const d = new Date(t);
+        return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) +
+               ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+      });
+
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: '{{ currency }}',
+            data: route.prices,
+            borderColor: '#38bdf8',
+            backgroundColor: 'rgba(56, 189, 248, 0.1)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 3,
+            pointBackgroundColor: '#38bdf8',
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: { legend: { display: false } },
+          scales: {
+            x: {
+              ticks: { color: '#64748b', maxRotation: 45, maxTicksLimit: 12 },
+              grid: { color: '#1e293b' }
+            },
+            y: {
+              ticks: { color: '#64748b', callback: v => '{{ currency }} ' + v.toFixed(0) },
+              grid: { color: '#334155' }
+            }
+          }
+        }
+      });
+    });
+  </script>
+</body>
+</html>
