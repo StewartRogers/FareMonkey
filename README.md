@@ -1,6 +1,6 @@
 # FareMonkey
 
-Flight price monitor that tracks fares via the [Amadeus Flight Offers Search API](https://developers.amadeus.com/self-service/category/flights/api-doc/flight-offers-search) and sends Telegram alerts when prices move significantly.
+Flight price monitor that tracks fares via the [Amadeus Flight Offers Search API](https://developers.amadeus.com/self-service/category/flights/api-doc/flight-offers-search) and sends Telegram alerts when prices move significantly. Includes a Flask web dashboard for viewing price history.
 
 ## How it works
 
@@ -8,7 +8,9 @@ Flight price monitor that tracks fares via the [Amadeus Flight Offers Search API
 2. Queries Amadeus for the cheapest current fare on each route
 3. Compares to the last saved price in `state.json`
 4. Sends a Telegram message when the price changes by more than `ALERT_THRESHOLD_PCT` (default 3%)
-5. Runs hourly via GitHub Actions
+5. Stores full price history for each route as a time-series
+6. Runs hourly via cron (local or GitHub Actions)
+7. Flask dashboard at `http://localhost:5000` shows live charts of price history
 
 ## Quick start
 
@@ -35,9 +37,41 @@ Edit `routes.json` with the flights you want to track:
 
 Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. `return_date` and `adults` are optional (defaults to one-way, 1 adult).
 
-### 3. Set up secrets
+### 3. Install and configure
 
-Add these as GitHub repository secrets (*Settings > Secrets and variables > Actions*):
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your credentials
+```
+
+### 4. Run the dashboard
+
+```bash
+python app.py
+```
+
+Open `http://localhost:5000` in your browser. The dashboard shows price charts, percentage changes, and API usage stats. It reads from `state.json` on each page load.
+
+### 5. Run the monitor
+
+One-off:
+```bash
+python flight_monitor.py
+```
+
+Set up an hourly cron job on your Linux server:
+```bash
+crontab -e
+# Add this line (adjust the path):
+0 * * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
+```
+
+Or use the included systemd timer (see `faremonkey.service` and `faremonkey.timer`).
+
+### 6. GitHub Actions (alternative to local cron)
+
+If you prefer running the monitor via GitHub Actions instead of local cron, add these as repository secrets (*Settings > Secrets and variables > Actions*):
 
 | Secret | Description |
 |--------|-------------|
@@ -46,7 +80,7 @@ Add these as GitHub repository secrets (*Settings > Secrets and variables > Acti
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Your Telegram chat ID |
 
-Optional repository variables (*Settings > Secrets and variables > Actions > Variables*):
+Optional repository variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -57,18 +91,22 @@ Optional repository variables (*Settings > Secrets and variables > Actions > Var
 | `ALERT_THRESHOLD_PCT` | `3` | Price change % to trigger alert |
 | `MONTHLY_CALL_CAP` | `1900` | Max API calls per month |
 
-### 4. Enable the workflow
+The workflow runs automatically every hour and commits `state.json` back.
 
-Push to your repository. The workflow runs automatically every hour, or trigger it manually from the *Actions* tab.
+## Environment variables
 
-## Running locally
-
-```bash
-cp .env.example .env
-# Edit .env with your credentials
-pip install -r requirements.txt
-python flight_monitor.py
-```
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `AMADEUS_CLIENT_ID` | Yes | - | Amadeus API key |
+| `AMADEUS_CLIENT_SECRET` | Yes | - | Amadeus API secret |
+| `TELEGRAM_BOT_TOKEN` | No | - | Telegram bot token (alerts disabled if unset) |
+| `TELEGRAM_CHAT_ID` | No | - | Telegram chat ID |
+| `CURRENCY` | No | `USD` | Currency for price queries |
+| `TIMEZONE` | No | `UTC` | IANA timezone for active-hours check |
+| `ACTIVE_START` | No | `7` | Start of active window (hour) |
+| `ACTIVE_END` | No | `22` | End of active window (hour) |
+| `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
+| `MONTHLY_CALL_CAP` | No | `1900` | Max Amadeus API calls per calendar month |
 
 ## Free quota math
 
@@ -91,9 +129,12 @@ Scaling: with 2 routes you have comfortable headroom. If you add more routes, re
 
 | File | Purpose |
 |------|---------|
-| `flight_monitor.py` | Main monitor script |
+| `flight_monitor.py` | Price monitor script (runs via cron) |
+| `app.py` | Flask web dashboard |
+| `templates/dashboard.html` | Dashboard template with Chart.js charts |
 | `routes.json` | Routes to track (edit this) |
-| `state.json` | Persisted prices and API call counts (auto-generated) |
+| `state.json` | Persisted prices, history, and API call counts (auto-generated) |
+| `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local environment variables |
 | `.github/workflows/monitor.yml` | Hourly GitHub Actions workflow |
 

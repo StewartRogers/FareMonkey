@@ -192,7 +192,9 @@ def main() -> None:
             continue
 
         prev = prices.get(label, {}).get("price")
-        prices[label] = {"price": price, "updated": now_str}
+        history = prices.get(label, {}).get("history", [])
+        history.append({"price": price, "timestamp": now_str})
+        prices[label] = {"price": price, "updated": now_str, "history": history}
         print(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else ""))
 
         if prev is not None and prev > 0:
