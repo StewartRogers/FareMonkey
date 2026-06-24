@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """FareMonkey – Flight price monitor using the SerpAPI Google Flights API."""
 
+from __future__ import annotations
+
 import json
 import os
 import sys
