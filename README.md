@@ -1,22 +1,22 @@
 # FareMonkey
 
-Flight price monitor that tracks fares via the [Amadeus Flight Offers Search API](https://developers.amadeus.com/self-service/category/flights/api-doc/flight-offers-search) and sends Telegram alerts when prices move significantly. Includes a Flask web dashboard for viewing price history.
+Flight price monitor that tracks fares via the [SerpAPI Google Flights API](https://serpapi.com/google-flights-api) and sends Telegram alerts when prices move significantly. Includes a Flask web dashboard for viewing price history.
 
 ## How it works
 
 1. Reads routes from `routes.json`
-2. Queries Amadeus for the cheapest current fare on each route
+2. Queries SerpAPI (Google Flights) for the cheapest current fare on each route
 3. Compares to the last saved price in `state.json`
 4. Sends a Telegram message when the price changes by more than `ALERT_THRESHOLD_PCT` (default 3%)
 5. Stores full price history for each route as a time-series
-6. Runs hourly via cron (local or GitHub Actions)
+6. Runs on a schedule via cron (local or GitHub Actions)
 7. Flask dashboard at `http://localhost:5000` shows live charts of price history
 
 ## Quick start
 
 ### 1. Get API credentials
 
-- **Amadeus**: Create a free account at [developers.amadeus.com](https://developers.amadeus.com). Register an app under *My Self-Service Apps* to get your production API key and secret.
+- **SerpAPI**: Create a free account at [serpapi.com](https://serpapi.com). Copy your single API key from the [dashboard](https://serpapi.com/manage-api-key). The free plan includes 100 searches/month.
 - **Telegram**: Message [@BotFather](https://t.me/BotFather) to create a bot. Get your chat ID by messaging [@userinfobot](https://t.me/userinfobot).
 
 ### 2. Configure routes
@@ -60,11 +60,11 @@ One-off:
 python flight_monitor.py
 ```
 
-Set up an hourly cron job on your Linux server:
+Set up a cron job on your Linux server (every 6 hours to stay within the SerpAPI search budget):
 ```bash
 crontab -e
 # Add this line (adjust the path):
-0 * * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
+0 */6 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
 ```
 
 ### 6. GitHub Actions (alternative to local cron)
@@ -73,8 +73,7 @@ If you prefer running the monitor via GitHub Actions instead of local cron, add 
 
 | Secret | Description |
 |--------|-------------|
-| `AMADEUS_CLIENT_ID` | Amadeus API key |
-| `AMADEUS_CLIENT_SECRET` | Amadeus API secret |
+| `SERPAPI_API_KEY` | SerpAPI API key |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | Your Telegram chat ID |
 
@@ -87,16 +86,15 @@ Optional repository variables:
 | `ACTIVE_START` | `7` | Hour to start checking (local time) |
 | `ACTIVE_END` | `22` | Hour to stop checking (local time) |
 | `ALERT_THRESHOLD_PCT` | `3` | Price change % to trigger alert |
-| `MONTHLY_CALL_CAP` | `1900` | Max API calls per month |
+| `MONTHLY_CALL_CAP` | `240` | Max API calls per month |
 
-The workflow runs automatically every hour and commits `state.json` back.
+The workflow runs automatically every 6 hours and commits `state.json` back.
 
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `AMADEUS_CLIENT_ID` | Yes | - | Amadeus API key |
-| `AMADEUS_CLIENT_SECRET` | Yes | - | Amadeus API secret |
+| `SERPAPI_API_KEY` | Yes | - | SerpAPI API key |
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram bot token (alerts disabled if unset) |
 | `TELEGRAM_CHAT_ID` | No | - | Telegram chat ID |
 | `CURRENCY` | No | `USD` | Currency for price queries |
@@ -104,24 +102,23 @@ The workflow runs automatically every hour and commits `state.json` back.
 | `ACTIVE_START` | No | `7` | Start of active window (hour) |
 | `ACTIVE_END` | No | `22` | End of active window (hour) |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
-| `MONTHLY_CALL_CAP` | No | `1900` | Max Amadeus API calls per calendar month |
+| `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
 
-## Free quota math
+## Quota math
 
-Amadeus provides **2,000 free API calls per month** on self-service production keys.
+SerpAPI charges **1 search per route per run** — there is no separate token/auth request. Budget your runs against your plan's monthly search allowance.
 
 | Resource | Calls |
 |----------|-------|
-| OAuth token requests | ~1 per run |
 | Flight search (per route) | 1 per run |
-| **Total per run** (2 routes) | **3** |
-| Runs per day (hourly, 7 AM-10 PM = 15 hrs) | **15** |
-| **Calls per day** | **45** |
-| **Calls per month** (30 days) | **~1,350** |
+| **Total per run** (2 routes) | **2** |
+| Runs per day (every 6 hours) | **4** |
+| **Calls per day** | **8** |
+| **Calls per month** (30 days) | **~240** |
 
-With `MONTHLY_CALL_CAP=1900` (default), the monitor stops making calls before hitting the 2,000 free limit, so you are never billed. The cap is tracked in `state.json` and resets each calendar month.
+The default `MONTHLY_CALL_CAP=240` leaves a small buffer below a 250-search/month plan. The monitor stops making calls once the cap is reached; the cap is tracked in `state.json` and resets each calendar month.
 
-Scaling: with 2 routes you have comfortable headroom. If you add more routes, reduce the active window or increase the cron interval to stay within quota.
+**Be economical**: hourly checks would burn ~1,440 searches/month with 2 routes — far above 250. The workflow therefore runs **every 6 hours** (`0 */6 * * *`). To adjust your budget: change the cron interval, narrow the active-hours window, reduce the number of routes, or raise `MONTHLY_CALL_CAP` if you upgrade your SerpAPI plan.
 
 ## Files
 

@@ -2,7 +2,7 @@
 
 ## Project overview
 
-FareMonkey is a Python-based flight price monitor with a web dashboard. It queries the Amadeus Flight Offers Search API (production) for the cheapest fares on configured routes, compares prices to previously recorded values, sends Telegram alerts when prices change beyond a configurable threshold, and stores full price history for visualization in a Flask dashboard. It runs hourly via local cron or GitHub Actions.
+FareMonkey is a Python-based flight price monitor with a web dashboard. It queries the SerpAPI Google Flights API for the cheapest fares on configured routes, compares prices to previously recorded values, sends Telegram alerts when prices change beyond a configurable threshold, and stores full price history for visualization in a Flask dashboard. It runs every 6 hours via local cron or GitHub Actions.
 
 ## Tech stack
 
@@ -11,7 +11,7 @@ FareMonkey is a Python-based flight price monitor with a web dashboard. It queri
 - **Charting**: Chart.js v4 (CDN, no build step)
 - **Dependencies**: `flask`, `requests`, `tzdata` (see `requirements.txt`)
 - **CI/CD**: GitHub Actions (`.github/workflows/monitor.yml`)
-- **External APIs**: Amadeus Flight Offers Search v2, Telegram Bot API
+- **External APIs**: SerpAPI Google Flights (`engine=google_flights`), Telegram Bot API
 
 ## Repository structure
 
@@ -26,7 +26,7 @@ FareMonkey/
 ├── requirements.txt           # Python dependencies
 ├── .env.example               # Environment variable template
 ├── .github/workflows/
-│   └── monitor.yml            # Hourly cron workflow
+│   └── monitor.yml            # Scheduled cron workflow (every 6 hours)
 ├── CLAUDE.md                  # This file
 ├── README.md                  # User-facing documentation
 ├── LICENSE                    # MIT license
@@ -35,7 +35,7 @@ FareMonkey/
 
 ## Key files
 
-- **`flight_monitor.py`**: Monitor script. Reads config from env vars, loads routes from `routes.json`, authenticates with Amadeus OAuth2, searches for cheapest flights, compares against `state.json`, sends Telegram alerts on significant price changes, appends to price history, and tracks API call counts per month.
+- **`flight_monitor.py`**: Monitor script. Reads config from env vars, loads routes from `routes.json`, queries SerpAPI Google Flights (single API key, no OAuth) for the cheapest flights, compares against `state.json`, sends Telegram alerts on significant price changes, appends to price history, and tracks API call counts per month. Maps `routes.json` fields to SerpAPI params: `travel_class` strings → integer codes (`TRAVEL_CLASS_MAP`), `non_stop` → `stops` (1 = nonstop only, 0 = any), and `return_date` presence → `type` (1 = round trip, 2 = one way). Takes the minimum price across `best_flights` and `other_flights`.
 - **`app.py`**: Flask app serving the dashboard at `http://localhost:5000`. Reads `state.json` on each request. Also exposes `/api/state` as raw JSON.
 - **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, and API usage bar charts.
 - **`routes.json`**: JSON array of route objects with fields: `origin`, `destination`, `departure_date`, optional `return_date`, optional `adults`.
@@ -66,8 +66,7 @@ All configuration is read from environment variables (no hardcoded credentials):
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `AMADEUS_CLIENT_ID` | Yes | - | Amadeus API key |
-| `AMADEUS_CLIENT_SECRET` | Yes | - | Amadeus API secret |
+| `SERPAPI_API_KEY` | Yes | - | SerpAPI API key (single key for Google Flights) |
 | `TELEGRAM_BOT_TOKEN` | No | - | Telegram bot token (alerts disabled if unset) |
 | `TELEGRAM_CHAT_ID` | No | - | Telegram chat ID |
 | `CURRENCY` | No | `USD` | Currency for price queries |
@@ -75,7 +74,7 @@ All configuration is read from environment variables (no hardcoded credentials):
 | `ACTIVE_START` | No | `7` | Start of active window (hour, local time) |
 | `ACTIVE_END` | No | `22` | End of active window (hour, local time) |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
-| `MONTHLY_CALL_CAP` | No | `1900` | Max Amadeus API calls per calendar month |
+| `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
 
 ## Running locally
 
@@ -96,7 +95,7 @@ python app.py  # http://localhost:5000
 - **No build step**: The Flask app uses a Jinja2 template with Chart.js from CDN. No webpack, npm, or frontend toolchain.
 - **Config via env vars only**: Never hardcode credentials or API keys. Use `os.environ.get()` with sensible defaults.
 - **State file**: `state.json` is the only mutable data store. It must remain JSON-serializable and human-readable. The `history` array grows over time — this is intentional for charting.
-- **API call safety**: Always check `can_make_calls()` before making Amadeus requests. The monthly cap exists to prevent billing — never bypass it.
+- **API call safety**: Always check `can_make_calls()` before making SerpAPI requests. The monthly cap exists to prevent billing — never bypass it.
 - **Active hours**: The monitor self-skips outside the configured active window. This is intentional, not a bug.
 - **Dashboard is read-only**: `app.py` never writes to `state.json`. Only `flight_monitor.py` writes state.
 
@@ -116,7 +115,7 @@ Use a WSGI server: `pip install gunicorn && gunicorn app:app -b 0.0.0.0:5000`
 
 ## Guardrails
 
-- The `MONTHLY_CALL_CAP` (default 1900) is set 100 calls below the Amadeus free tier limit of 2000. Do not raise it above 2000 unless the user has a paid plan.
+- The `MONTHLY_CALL_CAP` (default 240) leaves a small buffer below the user's 250-search/month SerpAPI plan. Each run costs 1 search per route (no separate token call). Do not raise it above the user's plan limit. The GitHub Actions workflow runs every 6 hours (not hourly) to stay within budget — hourly checks would far exceed 250/month.
 - `state.json` is committed by GitHub Actions with `[skip ci]` in the commit message to prevent recursive workflow triggers.
 - Credentials are stored as GitHub repository secrets or in `.env` (gitignored), never in code.
 - The Flask dashboard binds to `0.0.0.0:5000` in dev mode. For production, use gunicorn behind a reverse proxy.

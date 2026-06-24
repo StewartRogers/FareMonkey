@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FareMonkey – Flight price monitor using the Amadeus Flight Offers Search API."""
+"""FareMonkey – Flight price monitor using the SerpAPI Google Flights API."""
 
 import json
 import os
@@ -10,12 +10,18 @@ from pathlib import Path
 
 import requests
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # python-dotenv is optional; cron/CI inject env vars directly
+
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
 
-AMADEUS_CLIENT_ID = os.environ.get("AMADEUS_CLIENT_ID", "")
-AMADEUS_CLIENT_SECRET = os.environ.get("AMADEUS_CLIENT_SECRET", "")
+SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 CURRENCY = os.environ.get("CURRENCY", "USD")
@@ -23,12 +29,21 @@ TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 ACTIVE_START = int(os.environ.get("ACTIVE_START", "7"))
 ACTIVE_END = int(os.environ.get("ACTIVE_END", "22"))
 ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3"))
-MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "1900"))
+NOTIFY_EVERY_RUN = os.environ.get("NOTIFY_EVERY_RUN", "true").lower() in ("1", "true", "yes", "on")
+MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "240"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "1000"))
 
-AMADEUS_BASE = "https://api.amadeus.com"
+SERPAPI_BASE = "https://serpapi.com/search"
 STATE_FILE = Path(__file__).parent / "state.json"
 ROUTES_FILE = Path(__file__).parent / "routes.json"
+
+# SerpAPI Google Flights travel_class codes
+TRAVEL_CLASS_MAP = {
+    "ECONOMY": 1,
+    "PREMIUM_ECONOMY": 2,
+    "BUSINESS": 3,
+    "FIRST": 4,
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -90,53 +105,93 @@ def can_make_calls(state: dict, needed: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Amadeus API
+# SerpAPI Google Flights
 # ---------------------------------------------------------------------------
 
 
-def get_amadeus_token() -> str:
-    resp = requests.post(
-        f"{AMADEUS_BASE}/v1/security/oauth2/token",
-        data={
-            "grant_type": "client_credentials",
-            "client_id": AMADEUS_CLIENT_ID,
-            "client_secret": AMADEUS_CLIENT_SECRET,
-        },
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def search_cheapest(token: str, route: dict) -> float | None:
-    """Return the cheapest total price for a route, or None on failure."""
-    params = {
-        "originLocationCode": route["origin"],
-        "destinationLocationCode": route["destination"],
-        "departureDate": route["departure_date"],
-        "adults": route.get("adults", 1),
-        "nonStop": str(route.get("non_stop", True)).lower(),
-        "travelClass": route.get("travel_class", "ECONOMY"),
-        "currencyCode": CURRENCY,
-        "max": 1,
+def _extract_details(flight: dict) -> dict:
+    """Pull human-readable details from a SerpAPI flight option."""
+    segments = flight.get("flights", [])
+    layovers = flight.get("layovers", [])
+    airlines: list[str] = []
+    flight_numbers: list[str] = []
+    for seg in segments:
+        airline = seg.get("airline")
+        if airline and airline not in airlines:
+            airlines.append(airline)
+        if seg.get("flight_number"):
+            flight_numbers.append(seg["flight_number"])
+    dep = segments[0].get("departure_airport", {}) if segments else {}
+    arr = segments[-1].get("arrival_airport", {}) if segments else {}
+    return {
+        "airlines": airlines,
+        "flight_numbers": flight_numbers,
+        "departure_time": dep.get("time"),
+        "arrival_time": arr.get("time"),
+        "total_duration": flight.get("total_duration"),  # minutes
+        "stops": len(layovers),
+        "layover_airports": [lo.get("id") for lo in layovers],
     }
-    if route.get("return_date"):
-        params["returnDate"] = route["return_date"]
 
-    resp = requests.get(
-        f"{AMADEUS_BASE}/v2/shopping/flight-offers",
-        headers={"Authorization": f"Bearer {token}"},
-        params=params,
-        timeout=30,
+
+def search_cheapest(route: dict) -> dict | None:
+    """Return the cheapest option (price + details) for a route, or None on failure."""
+    travel_class = TRAVEL_CLASS_MAP.get(
+        str(route.get("travel_class", "ECONOMY")).upper(), 1
     )
+    has_return = bool(route.get("return_date"))
+    params = {
+        "engine": "google_flights",
+        "api_key": SERPAPI_API_KEY,
+        "departure_id": route["origin"],
+        "arrival_id": route["destination"],
+        "outbound_date": route["departure_date"],
+        "adults": route.get("adults", 1),
+        "travel_class": travel_class,
+        # SerpAPI stops: 0 = any, 1 = nonstop only
+        "stops": 1 if route.get("non_stop", True) else 0,
+        "currency": CURRENCY,
+        # SerpAPI type: 1 = round trip, 2 = one way
+        "type": 1 if has_return else 2,
+    }
+    if has_return:
+        params["return_date"] = route["return_date"]
+
+    resp = requests.get(SERPAPI_BASE, params=params, timeout=30)
     if resp.status_code != 200:
         print(f"  API error {resp.status_code}: {resp.text[:200]}")
         return None
 
-    data = resp.json().get("data", [])
-    if not data:
+    data = resp.json()
+    if data.get("error"):
+        print(f"  API error: {data['error']}")
         return None
-    return float(data[0]["price"]["total"])
+
+    candidates = [
+        flight
+        for key in ("best_flights", "other_flights")
+        for flight in data.get(key, [])
+        if flight.get("price") is not None
+    ]
+    if not candidates:
+        return None
+
+    cheapest = min(candidates, key=lambda f: f["price"])
+    offer = {"price": float(cheapest["price"])}
+    offer.update(_extract_details(cheapest))
+    return offer
+
+
+def format_offer(offer: dict) -> str:
+    """One-line summary of a flight offer for console/Telegram output."""
+    airlines = ", ".join(offer.get("airlines") or []) or "?"
+    stops = offer.get("stops", 0)
+    stops_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
+    parts = [airlines, stops_str]
+    dur = offer.get("total_duration")
+    if dur:
+        parts.append(f"{dur // 60}h {dur % 60:02d}m")
+    return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +203,27 @@ def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print(f"  [Telegram disabled] {message}")
         return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"},
-            timeout=15,
-        )
+        resp = requests.post(url, json=payload, timeout=15)
+        body = resp.json()
+        if body.get("ok"):
+            return
+        # Telegram returns HTTP 200 with ok=false on Markdown parse errors caused by
+        # unescaped *, _, ` or [ in dynamic text (airline names, labels). Retry as
+        # plain text so the alert still lands instead of being silently dropped.
+        print(f"  [Telegram error] {body.get('description')}; retrying without Markdown")
+        payload.pop("parse_mode", None)
+        resp = requests.post(url, json=payload, timeout=15)
+        body = resp.json()
+        if not body.get("ok"):
+            print(f"  [Telegram error] {body.get('description')}")
     except requests.RequestException as e:
         print(f"  [Telegram error] {e}")
+    except ValueError as e:  # non-JSON response body
+        print(f"  [Telegram error] invalid response: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +232,8 @@ def send_telegram(message: str) -> None:
 
 
 def main() -> None:
-    if not AMADEUS_CLIENT_ID or not AMADEUS_CLIENT_SECRET:
-        sys.exit("Error: AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET must be set.")
+    if not SERPAPI_API_KEY:
+        sys.exit("Error: SERPAPI_API_KEY must be set.")
 
     if not is_within_active_hours():
         print(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
@@ -177,8 +245,8 @@ def main() -> None:
 
     state = load_json(STATE_FILE)
 
-    # 1 token call + 1 search call per route
-    calls_needed = 1 + len(routes)
+    # 1 search call per route (SerpAPI uses a single API key, no token call)
+    calls_needed = len(routes)
     if not can_make_calls(state, calls_needed):
         print(
             f"Monthly cap would be exceeded ({get_call_count(state)}/{MONTHLY_CALL_CAP}). "
@@ -187,9 +255,6 @@ def main() -> None:
         save_json(STATE_FILE, state)
         return
 
-    token = get_amadeus_token()
-    increment_call_count(state, 1)  # token call
-
     prices = state.setdefault("prices", {})
     now_str = current_local_time().isoformat()
 
@@ -197,32 +262,52 @@ def main() -> None:
         label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
         print(f"Checking {label} ...")
 
-        price = search_cheapest(token, route)
+        offer = search_cheapest(route)
         increment_call_count(state, 1)
 
-        if price is None:
+        if offer is None:
             print(f"  No offers found for {label}")
             continue
+
+        price = offer["price"]
+        details = {k: v for k, v in offer.items() if k != "price"}
 
         prev = prices.get(label, {}).get("price")
         history = prices.get(label, {}).get("history", [])
         history.append({"price": price, "timestamp": now_str})
         if len(history) > MAX_HISTORY:
             history = history[-MAX_HISTORY:]
-        prices[label] = {"price": price, "updated": now_str, "history": history}
+        prices[label] = {"price": price, "updated": now_str, "details": details, "history": history}
         print(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else ""))
+        print(f"  {format_offer(offer)}")
 
-        if prev is not None and prev > 0:
-            pct_change = ((price - prev) / prev) * 100
-            if abs(pct_change) >= ALERT_THRESHOLD_PCT:
-                direction = "dropped" if pct_change < 0 else "rose"
-                send_telegram(
-                    f"{'✈️' if pct_change < 0 else '⚠️'} *{label}*\n"
-                    f"Price {direction} *{abs(pct_change):.1f}%*\n"
-                    f"{CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
-                )
+        pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
+        significant = pct_change is not None and abs(pct_change) >= ALERT_THRESHOLD_PCT
+
+        if pct_change is None:
+            icon = "🐒"
+            change_line = f"Baseline: {CURRENCY} {price:.2f}"
+            print("  First check — baseline recorded.")
+        elif pct_change <= -ALERT_THRESHOLD_PCT:
+            icon = "✈️"
+            change_line = f"Price *dropped {abs(pct_change):.1f}%*: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
+        elif pct_change >= ALERT_THRESHOLD_PCT:
+            icon = "⚠️"
+            change_line = f"Price *rose {pct_change:.1f}%*: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
+        elif pct_change == 0:
+            icon = "➡️"
+            change_line = f"No change: {CURRENCY} {price:.2f}"
         else:
-            print(f"  First check — baseline recorded.")
+            icon = "🔹"
+            arrow = "▼" if pct_change < 0 else "▲"
+            change_line = f"{arrow} {abs(pct_change):.1f}%: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
+
+        if NOTIFY_EVERY_RUN or significant:
+            send_telegram(
+                f"{icon} *{label}*\n"
+                f"{change_line}\n"
+                f"{format_offer(offer)}"
+            )
 
     state["last_run"] = now_str
     save_json(STATE_FILE, state)
