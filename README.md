@@ -41,9 +41,13 @@ Fields: `origin` and `destination` are IATA airport codes. `departure_date` is r
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
-# Edit .env with your credentials
 ```
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with your credentials.
 
 ### 4. Run the dashboard
 
@@ -61,9 +65,14 @@ python flight_monitor.py
 ```
 
 Set up a cron job on your Linux server (every 6 hours to stay within the SerpAPI search budget):
+
 ```bash
 crontab -e
-# Add this line (adjust the path):
+```
+
+Add this line (adjust the path):
+
+```
 0 */6 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
 ```
 
@@ -87,6 +96,7 @@ Optional repository variables:
 | `ACTIVE_END` | `22` | Hour to stop checking (local time) |
 | `ALERT_THRESHOLD_PCT` | `3` | Price change % to trigger alert |
 | `MONTHLY_CALL_CAP` | `240` | Max API calls per month |
+| `NOTIFY_EVERY_RUN` | `true` | Send alerts on every run, not just significant changes |
 
 The workflow runs automatically every 6 hours and commits `state.json` back.
 
@@ -102,7 +112,9 @@ The workflow runs automatically every 6 hours and commits `state.json` back.
 | `ACTIVE_START` | No | `7` | Start of active window (hour) |
 | `ACTIVE_END` | No | `22` | End of active window (hour) |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
+| `NOTIFY_EVERY_RUN` | No | `true` | Send Telegram message on every run, not just significant changes |
 | `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
+| `MAX_HISTORY` | No | `1000` | Max price history entries kept per route |
 
 ## Quota math
 
@@ -131,7 +143,7 @@ The default `MONTHLY_CALL_CAP=240` leaves a small buffer below a 250-search/mont
 | `state.json` | Persisted prices, history, and API call counts (auto-generated) |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local environment variables |
-| `.github/workflows/monitor.yml` | Hourly GitHub Actions workflow |
+| `.github/workflows/monitor.yml` | GitHub Actions workflow (every 6 hours) |
 
 ## License
 
