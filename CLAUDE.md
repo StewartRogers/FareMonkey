@@ -74,7 +74,9 @@ All configuration is read from environment variables (no hardcoded credentials):
 | `ACTIVE_START` | No | `7` | Start of active window (hour, local time) |
 | `ACTIVE_END` | No | `22` | End of active window (hour, local time) |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
+| `NOTIFY_EVERY_RUN` | No | `true` | Send Telegram message on every run, not just significant changes |
 | `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
+| `MAX_HISTORY` | No | `1000` | Max price history entries kept per route |
 
 ## Running locally
 
