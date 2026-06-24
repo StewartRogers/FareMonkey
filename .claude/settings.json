@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile flight_monitor.py)",
+      "Bash(python flight_monitor.py)",
+      "Bash(git --no-pager diff --stat HEAD)",
+      "Bash(git --no-pager diff HEAD)"
+    ]
+  }
+}

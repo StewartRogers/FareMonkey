@@ -2,7 +2,7 @@ name: Flight Price Monitor
 
 on:
   schedule:
-    - cron: "0 * * * *" # Every hour
+    - cron: "0 */6 * * *" # Every 6 hours (stay within SerpAPI search budget)
   workflow_dispatch: # Allow manual triggers
 
 permissions:
@@ -26,8 +26,7 @@ jobs:
 
       - name: Run flight monitor
         env:
-          AMADEUS_CLIENT_ID: ${{ secrets.AMADEUS_CLIENT_ID }}
-          AMADEUS_CLIENT_SECRET: ${{ secrets.AMADEUS_CLIENT_SECRET }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CURRENCY: ${{ vars.CURRENCY || 'USD' }}
@@ -35,7 +34,7 @@ jobs:
           ACTIVE_START: ${{ vars.ACTIVE_START || '7' }}
           ACTIVE_END: ${{ vars.ACTIVE_END || '22' }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT || '3' }}
-          MONTHLY_CALL_CAP: ${{ vars.MONTHLY_CALL_CAP || '1900' }}
+          MONTHLY_CALL_CAP: ${{ vars.MONTHLY_CALL_CAP || '240' }}
         run: python flight_monitor.py
 
       - name: Commit state.json

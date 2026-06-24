@@ -7,6 +7,13 @@ from pathlib import Path
 
 from flask import Flask, render_template
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).parent / ".env")
+except ImportError:
+    pass  # python-dotenv is optional; cron/CI inject env vars directly
+
 app = Flask(__name__)
 
 STATE_FILE = Path(__file__).parent / "state.json"
@@ -49,6 +56,7 @@ def dashboard():
             "timestamps": timestamps,
             "prices": price_values,
             "checks": len(history),
+            "details": info.get("details"),
         })
 
     total_calls = sum(api_calls.values())
@@ -60,7 +68,7 @@ def dashboard():
         api_calls=api_calls,
         total_calls=total_calls,
         last_run=last_run,
-        monthly_cap=int(os.environ.get("MONTHLY_CALL_CAP", "1900")),
+        monthly_cap=int(os.environ.get("MONTHLY_CALL_CAP", "240")),
     )
 
 

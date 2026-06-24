@@ -1,0 +1,43 @@
+{
+  "prices": {
+    "YVR-CUN 2026-12-23": {
+      "price": 4412.0,
+      "updated": "2026-06-23T21:11:45.795423-07:00",
+      "details": {
+        "airlines": [
+          "Flair Airlines"
+        ],
+        "flight_numbers": [
+          "F8 2810"
+        ],
+        "departure_time": "2026-12-23 23:30",
+        "arrival_time": "2026-12-24 07:25",
+        "total_duration": 355,
+        "stops": 0,
+        "layover_airports": []
+      },
+      "history": [
+        {
+          "price": 4412.0,
+          "timestamp": "2026-06-23T20:53:27.710874-07:00"
+        },
+        {
+          "price": 4412.0,
+          "timestamp": "2026-06-23T21:01:55.411987-07:00"
+        },
+        {
+          "price": 4412.0,
+          "timestamp": "2026-06-23T21:07:20.810653-07:00"
+        },
+        {
+          "price": 4412.0,
+          "timestamp": "2026-06-23T21:11:45.795423-07:00"
+        }
+      ]
+    }
+  },
+  "api_calls": {
+    "2026-06": 4
+  },
+  "last_run": "2026-06-23T21:11:45.795423-07:00"
+}
