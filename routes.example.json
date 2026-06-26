@@ -1,0 +1,19 @@
+[
+  {
+    "origin": "JFK",
+    "destination": "LHR",
+    "departure_date": "2026-09-15",
+    "return_date": "2026-09-22",
+    "adults": 1,
+    "non_stop": true,
+    "travel_class": "ECONOMY"
+  },
+  {
+    "origin": "SFO",
+    "destination": "NRT",
+    "departure_date": "2026-10-05",
+    "adults": 2,
+    "non_stop": false,
+    "travel_class": "PREMIUM_ECONOMY"
+  }
+]

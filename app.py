@@ -17,7 +17,6 @@ except ImportError:
 app = Flask(__name__)
 
 STATE_FILE = Path(__file__).parent / "state.json"
-ROUTES_FILE = Path(__file__).parent / "routes.json"
 CURRENCY = os.environ.get("CURRENCY", "USD")
 
 
@@ -31,7 +30,6 @@ def load_json(path: Path):
 @app.route("/")
 def dashboard():
     state = load_json(STATE_FILE)
-    routes = load_json(ROUTES_FILE)
     prices = state.get("prices", {})
     api_calls = state.get("api_calls", {})
     last_run = state.get("last_run")

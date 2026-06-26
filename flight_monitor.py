@@ -75,6 +75,17 @@ def save_json(path: Path, data: dict) -> None:
         raise
 
 
+def load_routes() -> list:
+    """Load routes.json (a personal, gitignored config), or exit with guidance."""
+    routes = load_json(ROUTES_FILE)
+    if not isinstance(routes, list) or not routes:
+        sys.exit(
+            f"Error: {ROUTES_FILE.name} must contain a non-empty JSON array. "
+            f"Copy routes.example.json to {ROUTES_FILE.name} and edit it."
+        )
+    return routes
+
+
 def current_local_time() -> datetime:
     """Return the current time in the configured TIMEZONE."""
     import zoneinfo
@@ -371,9 +382,7 @@ def run_scan(days: int) -> None:
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
 
-    routes = load_json(ROUTES_FILE)
-    if not isinstance(routes, list) or not routes:
-        sys.exit("Error: routes.json must contain a non-empty JSON array.")
+    routes = load_routes()
 
     state = load_json(STATE_FILE)
     offsets = list(range(-days, days + 1))
@@ -495,9 +504,7 @@ def main() -> None:
         print(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
         return
 
-    routes = load_json(ROUTES_FILE)
-    if not isinstance(routes, list) or not routes:
-        sys.exit("Error: routes.json must contain a non-empty JSON array.")
+    routes = load_routes()
 
     state = load_json(STATE_FILE)
 
