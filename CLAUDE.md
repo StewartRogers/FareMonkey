@@ -25,6 +25,7 @@ FareMonkey/
 │   └── dashboard.html         # Dashboard template with Chart.js charts
 ├── routes.json                # Route definitions to monitor (user-edited)
 ├── state.json                 # Auto-generated: prices, history, API call counts
+├── responses.jsonl            # Auto-generated: append-only archive of raw API responses
 ├── requirements.txt           # Python dependencies
 ├── .env.example               # Environment variable template
 ├── .github/workflows/
@@ -38,6 +39,7 @@ FareMonkey/
 ## Key files
 
 - **`flight_monitor.py`**: Monitor script. Reads config from env vars, loads routes from `routes.json`, queries SerpAPI Google Flights (single API key, no OAuth) for the cheapest flights, compares against `state.json`, sends Telegram alerts on significant price changes, appends to price history, and tracks API call counts per month. Maps `routes.json` fields to SerpAPI params: `travel_class` strings → integer codes (`TRAVEL_CLASS_MAP`), `non_stop` → `stops` (1 = nonstop only, 0 = any), and `return_date` presence → `type` (1 = round trip, 2 = one way). Takes the minimum price across `best_flights` and `other_flights`. From the **same** (already-paid-for) response it also captures the top-3 cheapest `alternatives`, the cheapest `nonstop_price`, and the `price_insights` verdict (`price_level`, `typical_price_range`) — no extra API cost. Also supports an on-demand **flexible-date scan** via `python flight_monitor.py --scan [--days N]` (`run_scan`): for each route it searches `departure_date ± N` days (default 3 → 7 searches/route; round trips shift `return_date` by the same offset to keep trip length constant), finds the cheapest date, stores it under `state.json` → `flex_scans`, and sends a Telegram summary. The scan is **not** part of the cron — each date costs one search, so it is run deliberately and is still bounded by `MONTHLY_CALL_CAP` (an over-cap scan is refused before any calls).
+- **`responses.jsonl`**: Append-only archive (one JSON object per line) of every raw API response received — the full payload (all offers, `price_insights`, airports, booking tokens, etc.) with the `api_key` stripped from the recorded query. Kept **out of `state.json`** so the dashboard (which parses `state.json` on every request) stays fast. Written by `archive_response()` whenever `ARCHIVE_RESPONSES` is true. Bounded by `RETENTION_DAYS`: each run (and the on-demand `--trim`) drops lines older than the window. Committed by the GitHub Actions workflow alongside `state.json` so the archive persists across CI runs.
 - **`app.py`**: Flask app serving the dashboard at `http://localhost:5000`. Reads `state.json` on each request. Also exposes `/api/state` as raw JSON.
 - **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, a price-level verdict and cheapest alternatives per route, flexible-date scan grids, and API usage bar charts.
 - **`routes.json`**: JSON array of route objects. Required: `origin`, `destination`, `departure_date` (IATA codes, ISO dates). Optional: `return_date` (presence makes it a round trip), `adults` (default 1), `non_stop` (default `true` → nonstop only), `travel_class` (`ECONOMY`/`PREMIUM_ECONOMY`/`BUSINESS`/`FIRST`, default `ECONOMY`).
@@ -100,6 +102,8 @@ All configuration is read from environment variables (no hardcoded credentials):
 | `NOTIFY_EVERY_RUN` | No | `true` | Send Telegram message on every run, not just significant changes |
 | `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
 | `MAX_HISTORY` | No | `1000` | Max price history entries kept per route |
+| `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
+| `RETENTION_DAYS` | No | `30` | Prune history points and archived responses older than this (each run) |
 
 ## Running locally
 
@@ -131,6 +135,9 @@ Edit `routes.json`. Each entry needs at minimum `origin`, `destination`, and `de
 
 ### Find the cheapest date for a route
 Run `python flight_monitor.py --scan` (optionally `--days N`) to sweep each route's `departure_date ± N` days and report the cheapest date. On-demand only; costs one search per date and respects `MONTHLY_CALL_CAP`.
+
+### Prune old data
+Trimming runs automatically at the end of every monitor run (drops history points and `responses.jsonl` lines older than `RETENTION_DAYS`). To prune on demand without a monitor run: `python flight_monitor.py --trim` (optionally `--days N`). No API cost.
 
 ### Change alert sensitivity
 Set the `ALERT_THRESHOLD_PCT` environment variable. Lower = more alerts.
