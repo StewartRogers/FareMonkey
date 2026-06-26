@@ -9,7 +9,7 @@ Flight price monitor that tracks fares via the [SerpAPI Google Flights API](http
 3. Compares to the last saved price in `state.json`
 4. Sends a Telegram message when the price changes by more than `ALERT_THRESHOLD_PCT` (default 3%)
 5. Stores full price history for each route as a time-series
-6. Runs on a schedule via cron (local or GitHub Actions)
+6. Runs on a schedule via local cron (state is kept local only, never pushed to GitHub)
 7. Flask dashboard at `http://localhost:5000` shows live charts of price history
 
 ## Quick start
@@ -97,9 +97,11 @@ highlighted; a Telegram summary is sent if alerts are configured.
 > `MONTHLY_CALL_CAP` is still enforced; an over-cap scan is refused before any
 > calls are made.
 
-### 7. GitHub Actions (alternative to local cron)
+### 7. GitHub Actions (manual smoke test only)
 
-If you prefer running the monitor via GitHub Actions instead of local cron, add these as repository secrets (*Settings > Secrets and variables > Actions*):
+> **Data stays local.** `state.json` and `responses.jsonl` are gitignored and are **never committed or pushed to GitHub**. The monitor is meant to run on your own machine (local cron); the included workflow is **manual-only** (`workflow_dispatch`, no schedule) and commits nothing. Because it has no persisted state, a CI run always behaves like a first check (baseline alert, no price comparison) — it's only useful as a connectivity/credentials smoke test.
+
+To run that manual test, add these as repository secrets (*Settings > Secrets and variables > Actions*):
 
 | Secret | Description |
 |--------|-------------|
@@ -119,7 +121,7 @@ Optional repository variables:
 | `MONTHLY_CALL_CAP` | `240` | Max API calls per month |
 | `NOTIFY_EVERY_RUN` | `true` | Send alerts on every run, not just significant changes |
 
-The workflow runs automatically every 6 hours and commits `state.json` back.
+Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*. It runs once and persists nothing.
 
 ## Environment variables
 
@@ -143,7 +145,7 @@ The workflow runs automatically every 6 hours and commits `state.json` back.
 
 Every raw API response is appended to `responses.jsonl` (one JSON object per line) so the full payload — all offers, `price_insights`, airports, booking tokens — is preserved, even though alerts and the dashboard only surface the single cheapest fare. The API key is stripped from the archived query. Set `ARCHIVE_RESPONSES=false` to turn this off.
 
-To keep the committed files from growing forever, each monitor run prunes both the in-state price history and `responses.jsonl` to the last `RETENTION_DAYS` days (default 30). You can also prune on demand without making any API calls:
+To keep these local files from growing forever, each monitor run prunes both the in-state price history and `responses.jsonl` to the last `RETENTION_DAYS` days (default 30). You can also prune on demand without making any API calls:
 
 ```bash
 python flight_monitor.py --trim            # prune to RETENTION_DAYS
@@ -174,11 +176,11 @@ The default `MONTHLY_CALL_CAP=240` leaves a small buffer below a 250-search/mont
 | `app.py` | Flask web dashboard |
 | `templates/dashboard.html` | Dashboard template with Chart.js charts |
 | `routes.json` | Routes to track (edit this) |
-| `state.json` | Persisted prices, history, and API call counts (auto-generated) |
-| `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated) |
+| `state.json` | Persisted prices, history, and API call counts (auto-generated, **local only / gitignored**) |
+| `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local environment variables |
-| `.github/workflows/monitor.yml` | GitHub Actions workflow (every 6 hours) |
+| `.github/workflows/monitor.yml` | GitHub Actions workflow (manual-only smoke test; commits no data) |
 
 ## License
 
