@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-FareMonkey is a Python-based flight price monitor with a web dashboard. It queries the SerpAPI Google Flights API for the cheapest fares on configured routes, compares prices to previously recorded values, sends Telegram alerts when prices change beyond a configurable threshold, and stores full price history for visualization in a Flask dashboard. It runs every 6 hours via local cron or GitHub Actions.
+FareMonkey is a Python-based flight price monitor with a web dashboard. It queries the SerpAPI Google Flights API for the cheapest fares on configured routes, compares prices to previously recorded values, sends Telegram alerts when prices change beyond a configurable threshold, and stores full price history for visualization in a Flask dashboard. It runs every 6 hours via local cron. `state.json` and `responses.jsonl` are kept **local only** (gitignored) and are never committed to the repo.
 
 ## Tech stack
 
@@ -24,12 +24,12 @@ FareMonkey/
 ├── templates/
 │   └── dashboard.html         # Dashboard template with Chart.js charts
 ├── routes.json                # Route definitions to monitor (user-edited)
-├── state.json                 # Auto-generated: prices, history, API call counts
-├── responses.jsonl            # Auto-generated: append-only archive of raw API responses
+├── state.json                 # Auto-generated, local only (gitignored): prices, history, API calls
+├── responses.jsonl            # Auto-generated, local only (gitignored): raw API response archive
 ├── requirements.txt           # Python dependencies
 ├── .env.example               # Environment variable template
 ├── .github/workflows/
-│   └── monitor.yml            # Scheduled cron workflow (every 6 hours)
+│   └── monitor.yml            # Manual-only workflow (smoke test; commits no data)
 ├── CLAUDE.md                  # This file
 ├── README.md                  # User-facing documentation
 ├── LICENSE                    # MIT license
@@ -39,7 +39,7 @@ FareMonkey/
 ## Key files
 
 - **`flight_monitor.py`**: Monitor script. Reads config from env vars, loads routes from `routes.json`, queries SerpAPI Google Flights (single API key, no OAuth) for the cheapest flights, compares against `state.json`, sends Telegram alerts on significant price changes, appends to price history, and tracks API call counts per month. Maps `routes.json` fields to SerpAPI params: `travel_class` strings → integer codes (`TRAVEL_CLASS_MAP`), `non_stop` → `stops` (1 = nonstop only, 0 = any), and `return_date` presence → `type` (1 = round trip, 2 = one way). Takes the minimum price across `best_flights` and `other_flights`. From the **same** (already-paid-for) response it also captures the top-3 cheapest `alternatives`, the cheapest `nonstop_price`, and the `price_insights` verdict (`price_level`, `typical_price_range`) — no extra API cost. Also supports an on-demand **flexible-date scan** via `python flight_monitor.py --scan [--days N]` (`run_scan`): for each route it searches `departure_date ± N` days (default 3 → 7 searches/route; round trips shift `return_date` by the same offset to keep trip length constant), finds the cheapest date, stores it under `state.json` → `flex_scans`, and sends a Telegram summary. The scan is **not** part of the cron — each date costs one search, so it is run deliberately and is still bounded by `MONTHLY_CALL_CAP` (an over-cap scan is refused before any calls).
-- **`responses.jsonl`**: Append-only archive (one JSON object per line) of every raw API response received — the full payload (all offers, `price_insights`, airports, booking tokens, etc.) with the `api_key` stripped from the recorded query. Kept **out of `state.json`** so the dashboard (which parses `state.json` on every request) stays fast. Written by `archive_response()` whenever `ARCHIVE_RESPONSES` is true. Bounded by `RETENTION_DAYS`: each run (and the on-demand `--trim`) drops lines older than the window. Committed by the GitHub Actions workflow alongside `state.json` so the archive persists across CI runs.
+- **`responses.jsonl`**: Append-only archive (one JSON object per line) of every raw API response received — the full payload (all offers, `price_insights`, airports, booking tokens, etc.) with the `api_key` stripped from the recorded query. Kept **out of `state.json`** so the dashboard (which parses `state.json` on every request) stays fast. Written by `archive_response()` whenever `ARCHIVE_RESPONSES` is true. Bounded by `RETENTION_DAYS`: each run (and the on-demand `--trim`) drops lines older than the window. **Local only** — gitignored and never committed/pushed to the repo.
 - **`app.py`**: Flask app serving the dashboard at `http://localhost:5000`. Reads `state.json` on each request. Also exposes `/api/state` as raw JSON.
 - **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, a price-level verdict and cheapest alternatives per route, flexible-date scan grids, and API usage bar charts.
 - **`routes.json`**: JSON array of route objects. Required: `origin`, `destination`, `departure_date` (IATA codes, ISO dates). Optional: `return_date` (presence makes it a round trip), `adults` (default 1), `non_stop` (default `true` → nonstop only), `travel_class` (`ECONOMY`/`PREMIUM_ECONOMY`/`BUSINESS`/`FIRST`, default `ECONOMY`).
@@ -150,7 +150,7 @@ Use a WSGI server: `pip install gunicorn && gunicorn app:app -b 0.0.0.0:5000`
 
 ## Guardrails
 
-- The `MONTHLY_CALL_CAP` (default 240) leaves a small buffer below the user's 250-search/month SerpAPI plan. Each run costs 1 search per route (no separate token call). Do not raise it above the user's plan limit. The GitHub Actions workflow runs every 6 hours (not hourly) to stay within budget — hourly checks would far exceed 250/month.
-- `state.json` is committed by GitHub Actions with `[skip ci]` in the commit message to prevent recursive workflow triggers.
+- The `MONTHLY_CALL_CAP` (default 240) leaves a small buffer below the user's 250-search/month SerpAPI plan. Each run costs 1 search per route (no separate token call). Do not raise it above the user's plan limit. Run the monitor no more than every 6 hours (not hourly) to stay within budget — hourly checks would far exceed 250/month.
+- `state.json` and `responses.jsonl` are runtime data, kept **local only** (gitignored). They are never committed or pushed to the repo. The monitor runs locally (e.g. cron on a Raspberry Pi); the GitHub Actions workflow is manual-only (`workflow_dispatch`), has no `schedule`, and commits nothing — so it cannot push data or double-spend the SerpAPI budget against the local cron.
 - Credentials are stored as GitHub repository secrets or in `.env` (gitignored), never in code.
 - The Flask dashboard binds to `127.0.0.1:5000` with `debug=True` in dev mode (`app.py`). For production or LAN access, use gunicorn behind a reverse proxy (gunicorn's `-b 0.0.0.0:5000` exposes it on all interfaces).
