@@ -30,6 +30,11 @@
     .flight-details { font-size: 0.85rem; color: #cbd5e1; margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; }
     .flight-details .pill { background: #0f172a; border-radius: 6px; padding: 0.15rem 0.5rem; }
     .flight-details .dim { color: #94a3b8; }
+    .route-stats { display: flex; gap: 1.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .route-stats .rs { display: flex; flex-direction: column; }
+    .route-stats .rs-label { font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
+    .route-stats .rs-val { font-size: 1.05rem; font-weight: 700; margin-top: 0.1rem; }
+    .route-stats .rs-val.low { color: #34d399; }
     .pill-low { background: #064e3b; color: #34d399; }
     .pill-typical { background: #1e3a5f; color: #93c5fd; }
     .pill-high { background: #7f1d1d; color: #fca5a5; }
@@ -111,6 +116,26 @@
           {% endif %}
         </div>
       </div>
+      {% if route.current_price is not none %}
+      <div class="route-stats">
+        <div class="rs">
+          <span class="rs-label">Current</span>
+          <span class="rs-val">{{ currency }} {{ "%.2f"|format(route.current_price) }}</span>
+        </div>
+        {% if route.cheapest_ever is not none %}
+        <div class="rs">
+          <span class="rs-label">Cheapest seen</span>
+          <span class="rs-val low">{{ currency }} {{ "%.2f"|format(route.cheapest_ever) }}</span>
+        </div>
+        {% endif %}
+        {% if route.average is not none %}
+        <div class="rs">
+          <span class="rs-label">Average</span>
+          <span class="rs-val">{{ currency }} {{ "%.2f"|format(route.average) }}</span>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
       {% if route.details %}
       {% set d = route.details %}
       <div class="flight-details">
@@ -201,20 +226,37 @@
                ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
       });
 
+      const datasets = [];
+      // Shade Google's typical price range behind the line, when we have it.
+      const tpr = route.details && route.details.typical_price_range;
+      if (tpr && tpr.length === 2) {
+        datasets.push({
+          label: 'typical high', data: route.prices.map(() => tpr[1]),
+          borderColor: 'rgba(148,163,184,0.35)', borderWidth: 1, borderDash: [4, 4],
+          pointRadius: 0, fill: false, tension: 0,
+        });
+        datasets.push({
+          label: 'typical low', data: route.prices.map(() => tpr[0]),
+          borderColor: 'rgba(148,163,184,0.35)', borderWidth: 1, borderDash: [4, 4],
+          pointRadius: 0, fill: '-1', backgroundColor: 'rgba(148,163,184,0.10)', tension: 0,
+        });
+      }
+      datasets.push({
+        label: '{{ currency }}',
+        data: route.prices,
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56, 189, 248, 0.1)',
+        fill: datasets.length === 0,  // keep the filled area only when there's no band behind it
+        tension: 0.3,
+        pointRadius: 3,
+        pointBackgroundColor: '#38bdf8',
+      });
+
       new Chart(ctx, {
         type: 'line',
         data: {
           labels: labels,
-          datasets: [{
-            label: '{{ currency }}',
-            data: route.prices,
-            borderColor: '#38bdf8',
-            backgroundColor: 'rgba(56, 189, 248, 0.1)',
-            fill: true,
-            tension: 0.3,
-            pointRadius: 3,
-            pointBackgroundColor: '#38bdf8',
-          }]
+          datasets: datasets
         },
         options: {
           responsive: true,

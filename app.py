@@ -49,11 +49,16 @@ def dashboard():
         if prev is not None and current is not None and prev > 0:
             pct_change = round(((current - prev) / prev) * 100, 1)
 
+        cheapest_ever = min(price_values) if price_values else None
+        average = round(sum(price_values) / len(price_values), 2) if price_values else None
+
         route_data.append({
             "label": label,
             "current_price": current,
             "previous_price": prev,
             "pct_change": pct_change,
+            "cheapest_ever": cheapest_ever,
+            "average": average,
             "timestamps": timestamps,
             "prices": price_values,
             "checks": len(history),
