@@ -17,7 +17,6 @@ except ImportError:
 app = Flask(__name__)
 
 STATE_FILE = Path(__file__).parent / "state.json"
-ROUTES_FILE = Path(__file__).parent / "routes.json"
 CURRENCY = os.environ.get("CURRENCY", "USD")
 
 
@@ -31,10 +30,10 @@ def load_json(path: Path):
 @app.route("/")
 def dashboard():
     state = load_json(STATE_FILE)
-    routes = load_json(ROUTES_FILE)
     prices = state.get("prices", {})
     api_calls = state.get("api_calls", {})
     last_run = state.get("last_run")
+    flex_scans = state.get("flex_scans", {})
 
     route_data = []
     for label, info in prices.items():
@@ -48,11 +47,16 @@ def dashboard():
         if prev is not None and current is not None and prev > 0:
             pct_change = round(((current - prev) / prev) * 100, 1)
 
+        cheapest_ever = min(price_values) if price_values else None
+        average = round(sum(price_values) / len(price_values), 2) if price_values else None
+
         route_data.append({
             "label": label,
             "current_price": current,
             "previous_price": prev,
             "pct_change": pct_change,
+            "cheapest_ever": cheapest_ever,
+            "average": average,
             "timestamps": timestamps,
             "prices": price_values,
             "checks": len(history),
@@ -68,6 +72,7 @@ def dashboard():
         api_calls=api_calls,
         total_calls=total_calls,
         last_run=last_run,
+        flex_scans=flex_scans,
         monthly_cap=int(os.environ.get("MONTHLY_CALL_CAP", "240")),
     )
 

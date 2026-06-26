@@ -30,6 +30,24 @@
     .flight-details { font-size: 0.85rem; color: #cbd5e1; margin-top: 0.5rem; display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; }
     .flight-details .pill { background: #0f172a; border-radius: 6px; padding: 0.15rem 0.5rem; }
     .flight-details .dim { color: #94a3b8; }
+    .route-stats { display: flex; gap: 1.5rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .route-stats .rs { display: flex; flex-direction: column; }
+    .route-stats .rs-label { font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
+    .route-stats .rs-val { font-size: 1.05rem; font-weight: 700; margin-top: 0.1rem; }
+    .route-stats .rs-val.low { color: #34d399; }
+    .pill-low { background: #064e3b; color: #34d399; }
+    .pill-typical { background: #1e3a5f; color: #93c5fd; }
+    .pill-high { background: #7f1d1d; color: #fca5a5; }
+    .alts { margin-top: 0.6rem; font-size: 0.8rem; color: #94a3b8; }
+    .alts .alt { display: flex; gap: 0.5rem; padding: 0.1rem 0; }
+    .alts .alt .price { color: #e2e8f0; font-weight: 600; min-width: 5.5rem; }
+    .flex-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(90px, 1fr)); gap: 0.4rem; margin-top: 0.75rem; }
+    .flex-day { background: #0f172a; border-radius: 8px; padding: 0.5rem; text-align: center; }
+    .flex-day .d { font-size: 0.72rem; color: #94a3b8; }
+    .flex-day .p { font-size: 0.9rem; font-weight: 600; margin-top: 0.2rem; }
+    .flex-day.best { background: #064e3b; }
+    .flex-day.best .p { color: #34d399; }
+    .flex-day.base { outline: 1px solid #38bdf8; }
     .chart-wrap { height: 250px; margin-top: 1rem; }
 
     .empty { text-align: center; padding: 4rem 1rem; color: #64748b; }
@@ -98,20 +116,79 @@
           {% endif %}
         </div>
       </div>
+      {% if route.current_price is not none %}
+      <div class="route-stats">
+        <div class="rs">
+          <span class="rs-label">Current</span>
+          <span class="rs-val">{{ currency }} {{ "%.2f"|format(route.current_price) }}</span>
+        </div>
+        {% if route.cheapest_ever is not none %}
+        <div class="rs">
+          <span class="rs-label">Cheapest seen</span>
+          <span class="rs-val low">{{ currency }} {{ "%.2f"|format(route.cheapest_ever) }}</span>
+        </div>
+        {% endif %}
+        {% if route.average is not none %}
+        <div class="rs">
+          <span class="rs-label">Average</span>
+          <span class="rs-val">{{ currency }} {{ "%.2f"|format(route.average) }}</span>
+        </div>
+        {% endif %}
+      </div>
+      {% endif %}
       {% if route.details %}
       {% set d = route.details %}
       <div class="flight-details">
         {% if d.airlines %}<span class="pill">{{ d.airlines|join(', ') }}</span>{% endif %}
         <span class="pill">{% if d.stops == 0 %}Nonstop{% else %}{{ d.stops }} stop{{ 's' if d.stops != 1 else '' }}{% if d.layover_airports %} <span class="dim">via {{ d.layover_airports|join(', ') }}</span>{% endif %}{% endif %}</span>
         {% if d.total_duration %}<span class="pill">{{ d.total_duration // 60 }}h {{ '%02d'|format(d.total_duration % 60) }}m</span>{% endif %}
+        {% if d.price_level %}<span class="pill pill-{{ d.price_level|lower }}">{{ d.price_level|capitalize }} vs typical{% if d.typical_price_range %} ({{ currency }} {{ d.typical_price_range[0] }}–{{ d.typical_price_range[1] }}){% endif %}</span>{% endif %}
+        {% if d.nonstop_price and route.current_price and d.stops != 0 and d.nonstop_price > route.current_price %}<span class="pill">Nonstop from {{ currency }} {{ "%.0f"|format(d.nonstop_price) }} <span class="dim">(+{{ "%.0f"|format(d.nonstop_price - route.current_price) }})</span></span>{% endif %}
         {% if d.departure_time %}<span class="dim">Dep {{ d.departure_time }}{% if d.arrival_time %} → Arr {{ d.arrival_time }}{% endif %}</span>{% endif %}
       </div>
+      {% if d.alternatives and d.alternatives|length > 1 %}
+      <div class="alts">
+        {% for a in d.alternatives %}
+        <div class="alt">
+          <span class="price">{{ currency }} {{ "%.2f"|format(a.price) }}</span>
+          <span>{{ a.airlines|join(', ') or '?' }} · {% if a.stops == 0 %}nonstop{% else %}{{ a.stops }} stop{{ 's' if a.stops != 1 else '' }}{% endif %}{% if a.total_duration %} · {{ a.total_duration // 60 }}h {{ '%02d'|format(a.total_duration % 60) }}m{% endif %}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
       {% endif %}
       <div class="chart-wrap">
         <canvas id="chart-{{ loop.index }}"></canvas>
       </div>
     </div>
     {% endfor %}
+
+    {% if flex_scans %}
+    {% for label, scan in flex_scans.items() %}
+    <div class="route-card">
+      <div class="route-header">
+        <div>
+          <div class="route-label">{{ label }} · flexible dates</div>
+          <div style="font-size:0.8rem;color:#94a3b8;margin-top:0.25rem;">±{{ scan.days }} days around {{ scan.base_date }}{% if scan.scanned %} · scanned {{ scan.scanned[:10] }}{% endif %}</div>
+        </div>
+        {% if scan.cheapest %}
+        <div style="text-align:right">
+          <div class="route-price">{{ currency }} {{ "%.2f"|format(scan.cheapest.price) }}</div>
+          <span class="badge badge-down">best: {{ scan.cheapest.date }}</span>
+        </div>
+        {% endif %}
+      </div>
+      <div class="flex-grid">
+        {% for r in scan.results %}
+        <div class="flex-day{% if scan.cheapest and r.date == scan.cheapest.date %} best{% endif %}{% if r.date == scan.base_date %} base{% endif %}">
+          <div class="d">{{ r.date[5:] }}</div>
+          <div class="p">{% if r.price is not none %}{{ currency }} {{ "%.0f"|format(r.price) }}{% else %}—{% endif %}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+    {% endif %}
 
     {% if api_calls %}
     <div class="route-card">
@@ -149,20 +226,37 @@
                ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
       });
 
+      const datasets = [];
+      // Shade Google's typical price range behind the line, when we have it.
+      const tpr = route.details && route.details.typical_price_range;
+      if (tpr && tpr.length === 2) {
+        datasets.push({
+          label: 'typical high', data: route.prices.map(() => tpr[1]),
+          borderColor: 'rgba(148,163,184,0.35)', borderWidth: 1, borderDash: [4, 4],
+          pointRadius: 0, fill: false, tension: 0,
+        });
+        datasets.push({
+          label: 'typical low', data: route.prices.map(() => tpr[0]),
+          borderColor: 'rgba(148,163,184,0.35)', borderWidth: 1, borderDash: [4, 4],
+          pointRadius: 0, fill: '-1', backgroundColor: 'rgba(148,163,184,0.10)', tension: 0,
+        });
+      }
+      datasets.push({
+        label: '{{ currency }}',
+        data: route.prices,
+        borderColor: '#38bdf8',
+        backgroundColor: 'rgba(56, 189, 248, 0.1)',
+        fill: datasets.length === 0,  // keep the filled area only when there's no band behind it
+        tension: 0.3,
+        pointRadius: 3,
+        pointBackgroundColor: '#38bdf8',
+      });
+
       new Chart(ctx, {
         type: 'line',
         data: {
           labels: labels,
-          datasets: [{
-            label: '{{ currency }}',
-            data: route.prices,
-            borderColor: '#38bdf8',
-            backgroundColor: 'rgba(56, 189, 248, 0.1)',
-            fill: true,
-            tension: 0.3,
-            pointRadius: 3,
-            pointBackgroundColor: '#38bdf8',
-          }]
+          datasets: datasets
         },
         options: {
           responsive: true,

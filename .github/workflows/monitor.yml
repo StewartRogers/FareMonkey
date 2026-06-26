@@ -1,12 +1,16 @@
 name: Flight Price Monitor
 
+# This project runs the monitor locally (e.g. cron on a Raspberry Pi); state.json
+# and responses.jsonl are kept local only and are never committed to the repo.
+# This workflow is therefore manual-only (workflow_dispatch) as an optional
+# connectivity/smoke test — it does NOT run on a schedule (so it can't
+# double-spend the SerpAPI budget against the local cron) and it does NOT persist
+# or commit any data back to GitHub.
 on:
-  schedule:
-    - cron: "0 */6 * * *" # Every 6 hours (stay within SerpAPI search budget)
-  workflow_dispatch: # Allow manual triggers
+  workflow_dispatch: # Manual trigger only
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   monitor:
@@ -24,6 +28,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Seed routes from template
+        # routes.json is gitignored (personal config), so a fresh checkout has
+        # only the template. The smoke test exercises the example routes.
+        run: cp routes.example.json routes.json
+
       - name: Run flight monitor
         env:
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
@@ -36,11 +45,3 @@ jobs:
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT || '3' }}
           MONTHLY_CALL_CAP: ${{ vars.MONTHLY_CALL_CAP || '240' }}
         run: python flight_monitor.py
-
-      - name: Commit state.json
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "Update state.json [skip ci]"
-          git push

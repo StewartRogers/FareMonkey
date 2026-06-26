@@ -147,6 +147,12 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# FareMonkey personal config & runtime data — kept local only, never pushed to the repo
+# (copy routes.example.json to routes.json and edit it)
+routes.json
+state.json
+responses.jsonl
+
 # Environments
 .env
 .envrc
