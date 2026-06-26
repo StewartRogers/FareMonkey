@@ -399,14 +399,17 @@ def run_scan(days: int) -> None:
     print(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
 
     for route in routes:
-        label = f"{route['origin']}-{route['destination']}"
         base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
         base_ret = (
             datetime.strptime(route["return_date"], "%Y-%m-%d").date()
             if route.get("return_date")
             else None
         )
-        print(f"Scanning {label} around {base_dep.isoformat()} ...")
+        # Match the price-history key format ("ORIGIN-DEST DATE") so multiple
+        # routes sharing an origin/destination but differing by date don't
+        # collide and overwrite each other in flex_scans.
+        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
+        print(f"Scanning {label} ...")
 
         results: list[dict] = []
         for off in offsets:

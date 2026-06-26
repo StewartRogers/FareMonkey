@@ -28,6 +28,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Seed routes from template
+        # routes.json is gitignored (personal config), so a fresh checkout has
+        # only the template. The smoke test exercises the example routes.
+        run: cp routes.example.json routes.json
+
       - name: Run flight monitor
         env:
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
