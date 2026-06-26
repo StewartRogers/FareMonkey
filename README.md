@@ -136,6 +136,19 @@ The workflow runs automatically every 6 hours and commits `state.json` back.
 | `NOTIFY_EVERY_RUN` | No | `true` | Send Telegram message on every run, not just significant changes |
 | `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
 | `MAX_HISTORY` | No | `1000` | Max price history entries kept per route |
+| `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
+| `RETENTION_DAYS` | No | `30` | Prune history and archived responses older than this (each run) |
+
+## Data archive & retention
+
+Every raw API response is appended to `responses.jsonl` (one JSON object per line) so the full payload — all offers, `price_insights`, airports, booking tokens — is preserved, even though alerts and the dashboard only surface the single cheapest fare. The API key is stripped from the archived query. Set `ARCHIVE_RESPONSES=false` to turn this off.
+
+To keep the committed files from growing forever, each monitor run prunes both the in-state price history and `responses.jsonl` to the last `RETENTION_DAYS` days (default 30). You can also prune on demand without making any API calls:
+
+```bash
+python flight_monitor.py --trim            # prune to RETENTION_DAYS
+python flight_monitor.py --trim --days 60  # keep the last 60 days
+```
 
 ## Quota math
 
@@ -162,6 +175,7 @@ The default `MONTHLY_CALL_CAP=240` leaves a small buffer below a 250-search/mont
 | `templates/dashboard.html` | Dashboard template with Chart.js charts |
 | `routes.json` | Routes to track (edit this) |
 | `state.json` | Persisted prices, history, and API call counts (auto-generated) |
+| `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated) |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local environment variables |
 | `.github/workflows/monitor.yml` | GitHub Actions workflow (every 6 hours) |

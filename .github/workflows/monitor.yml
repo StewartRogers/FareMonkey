@@ -37,10 +37,11 @@ jobs:
           MONTHLY_CALL_CAP: ${{ vars.MONTHLY_CALL_CAP || '240' }}
         run: python flight_monitor.py
 
-      - name: Commit state.json
+      - name: Commit state and response archive
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json
+          git add responses.jsonl 2>/dev/null || true  # archive may not exist on first run
           git diff --cached --quiet || git commit -m "Update state.json [skip ci]"
           git push

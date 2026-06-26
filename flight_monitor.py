@@ -34,10 +34,15 @@ ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3"))
 NOTIFY_EVERY_RUN = os.environ.get("NOTIFY_EVERY_RUN", "true").lower() in ("1", "true", "yes", "on")
 MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "240"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "1000"))
+ARCHIVE_RESPONSES = os.environ.get("ARCHIVE_RESPONSES", "true").lower() in ("1", "true", "yes", "on")
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 
 SERPAPI_BASE = "https://serpapi.com/search"
 STATE_FILE = Path(__file__).parent / "state.json"
 ROUTES_FILE = Path(__file__).parent / "routes.json"
+# Append-only archive of every raw API response (kept out of state.json so the
+# dashboard, which parses state.json on every request, stays fast).
+RESPONSES_FILE = Path(__file__).parent / "responses.jsonl"
 
 # SerpAPI Google Flights travel_class codes
 TRAVEL_CLASS_MAP = {
@@ -151,6 +156,92 @@ def _summarize(flight: dict) -> dict:
     }
 
 
+def archive_response(route: dict, params: dict, data: dict) -> None:
+    """Append the full raw API response to RESPONSES_FILE as one JSON line.
+
+    Records everything the API returned (all offers, price_insights, airports,
+    booking tokens, etc.) so nothing is discarded. The api_key is stripped from
+    the stored query. A failure here must never break monitoring, so errors are
+    only logged.
+    """
+    if not ARCHIVE_RESPONSES:
+        return
+    record = {
+        "timestamp": current_local_time().isoformat(),
+        "route": f"{route['origin']}-{route['destination']}",
+        "query": {k: v for k, v in params.items() if k != "api_key"},
+        "response": data,
+    }
+    try:
+        with open(RESPONSES_FILE, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as e:
+        print(f"  [archive error] {e}")
+
+
+def _is_older_than(timestamp: str, cutoff: datetime) -> bool:
+    """True if an ISO timestamp is strictly before cutoff. Unparseable → False
+    (keep the record rather than risk discarding data we can't date)."""
+    try:
+        return datetime.fromisoformat(timestamp) < cutoff
+    except (TypeError, ValueError):
+        return False
+
+
+def trim_history(state: dict, cutoff: datetime) -> int:
+    """Drop price-history points older than cutoff. Returns the number removed."""
+    removed = 0
+    for info in state.get("prices", {}).values():
+        history = info.get("history", [])
+        kept = [h for h in history if not _is_older_than(h.get("timestamp", ""), cutoff)]
+        removed += len(history) - len(kept)
+        info["history"] = kept
+    return removed
+
+
+def trim_responses(cutoff: datetime) -> int:
+    """Drop archived responses older than cutoff. Returns the number removed."""
+    if not RESPONSES_FILE.exists():
+        return 0
+    kept: list[str] = []
+    removed = 0
+    with open(RESPONSES_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ts = json.loads(line).get("timestamp", "")
+            except ValueError:
+                kept.append(line)  # keep unparseable lines rather than lose data
+                continue
+            if _is_older_than(ts, cutoff):
+                removed += 1
+            else:
+                kept.append(line)
+    if removed:
+        fd, tmp = tempfile.mkstemp(dir=RESPONSES_FILE.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                for line in kept:
+                    f.write(line + "\n")
+            os.replace(tmp, RESPONSES_FILE)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    return removed
+
+
+def trim_old_data(state: dict, days: int) -> tuple[int, int]:
+    """Prune history points and archived responses older than `days`.
+
+    Returns (history_points_removed, responses_removed). Mutates `state` in place
+    (caller is responsible for persisting it).
+    """
+    cutoff = current_local_time() - timedelta(days=days)
+    return trim_history(state, cutoff), trim_responses(cutoff)
+
+
 def search_cheapest(route: dict) -> dict | None:
     """Return the cheapest option (price + details) for a route, or None on failure."""
     travel_class = TRAVEL_CLASS_MAP.get(
@@ -180,6 +271,7 @@ def search_cheapest(route: dict) -> dict | None:
         return None
 
     data = resp.json()
+    archive_response(route, params, data)
     if data.get("error"):
         print(f"  API error: {data['error']}")
         return None
@@ -362,18 +454,37 @@ def run_scan(days: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _days_arg(argv: list[str], default: int) -> int:
+    """Parse an optional `--days N` flag, falling back to `default`."""
+    if "--days" not in argv:
+        return default
+    try:
+        days = int(argv[argv.index("--days") + 1])
+    except (IndexError, ValueError):
+        sys.exit("Error: --days requires an integer, e.g. --days 5")
+    if days < 1:
+        sys.exit("Error: --days must be >= 1")
+    return days
+
+
+def run_trim(days: int) -> None:
+    """Manually prune history and the response archive to the last `days` days."""
+    state = load_json(STATE_FILE)
+    hist_removed, resp_removed = trim_old_data(state, days)
+    save_json(STATE_FILE, state)
+    print(
+        f"Trimmed to last {days} days: removed {hist_removed} history point(s) "
+        f"and {resp_removed} archived response(s)."
+    )
+
+
 def main() -> None:
     argv = sys.argv[1:]
     if argv and argv[0] == "--scan":
-        days = 3
-        if "--days" in argv:
-            try:
-                days = int(argv[argv.index("--days") + 1])
-            except (IndexError, ValueError):
-                sys.exit("Error: --days requires an integer, e.g. --scan --days 5")
-        if days < 1:
-            sys.exit("Error: --days must be >= 1")
-        run_scan(days)
+        run_scan(_days_arg(argv, 3))
+        return
+    if argv and argv[0] == "--trim":
+        run_trim(_days_arg(argv, RETENTION_DAYS))
         return
 
     if not SERPAPI_API_KEY:
@@ -454,7 +565,16 @@ def main() -> None:
             )
 
     state["last_run"] = now_str
+
+    # Keep the dataset bounded: prune history and archived responses past the
+    # retention window every run so the committed files don't grow forever.
+    hist_removed, resp_removed = trim_old_data(state, RETENTION_DAYS)
     save_json(STATE_FILE, state)
+    if hist_removed or resp_removed:
+        print(
+            f"Trimmed {hist_removed} history point(s) and {resp_removed} "
+            f"archived response(s) older than {RETENTION_DAYS} days."
+        )
     print(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
 
 
