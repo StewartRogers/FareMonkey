@@ -211,10 +211,11 @@ def trim_responses(cutoff: datetime) -> int:
             if not line:
                 continue
             try:
-                ts = json.loads(line).get("timestamp", "")
+                obj = json.loads(line)
             except ValueError:
                 kept.append(line)  # keep unparseable lines rather than lose data
                 continue
+            ts = obj.get("timestamp", "") if isinstance(obj, dict) else ""
             if _is_older_than(ts, cutoff):
                 removed += 1
             else:
