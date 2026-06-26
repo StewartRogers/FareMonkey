@@ -21,7 +21,13 @@ Flight price monitor that tracks fares via the [SerpAPI Google Flights API](http
 
 ### 2. Configure routes
 
-Edit `routes.json` with the flights you want to track:
+Routes are your personal config. Copy the template and edit it:
+
+```bash
+cp routes.example.json routes.json
+```
+
+`routes.json` is **gitignored** (it holds your own itineraries) — only the template is tracked. Edit it with the flights you want to track:
 
 ```json
 [
@@ -175,7 +181,8 @@ The default `MONTHLY_CALL_CAP=240` leaves a small buffer below a 250-search/mont
 | `flight_monitor.py` | Price monitor script (runs via cron) |
 | `app.py` | Flask web dashboard |
 | `templates/dashboard.html` | Dashboard template with Chart.js charts |
-| `routes.json` | Routes to track (edit this) |
+| `routes.example.json` | Template routes — copy to `routes.json` |
+| `routes.json` | Routes to track — your personal config (**local only / gitignored**) |
 | `state.json` | Persisted prices, history, and API call counts (auto-generated, **local only / gitignored**) |
 | `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
 | `requirements.txt` | Python dependencies |

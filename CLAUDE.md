@@ -23,7 +23,8 @@ FareMonkey/
 ├── app.py                     # Flask web dashboard
 ├── templates/
 │   └── dashboard.html         # Dashboard template with Chart.js charts
-├── routes.json                # Route definitions to monitor (user-edited)
+├── routes.example.json        # Template routes (committed) — copy to routes.json
+├── routes.json                # Personal route definitions, local only (gitignored)
 ├── state.json                 # Auto-generated, local only (gitignored): prices, history, API calls
 ├── responses.jsonl            # Auto-generated, local only (gitignored): raw API response archive
 ├── requirements.txt           # Python dependencies
@@ -42,7 +43,7 @@ FareMonkey/
 - **`responses.jsonl`**: Append-only archive (one JSON object per line) of every raw API response received — the full payload (all offers, `price_insights`, airports, booking tokens, etc.) with the `api_key` stripped from the recorded query. Kept **out of `state.json`** so the dashboard (which parses `state.json` on every request) stays fast. Written by `archive_response()` whenever `ARCHIVE_RESPONSES` is true. Bounded by `RETENTION_DAYS`: each run (and the on-demand `--trim`) drops lines older than the window. **Local only** — gitignored and never committed/pushed to the repo.
 - **`app.py`**: Flask app serving the dashboard at `http://localhost:5000`. Reads `state.json` on each request. Also exposes `/api/state` as raw JSON.
 - **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, a price-level verdict and cheapest alternatives per route, flexible-date scan grids, and API usage bar charts.
-- **`routes.json`**: JSON array of route objects. Required: `origin`, `destination`, `departure_date` (IATA codes, ISO dates). Optional: `return_date` (presence makes it a round trip), `adults` (default 1), `non_stop` (default `true` → nonstop only), `travel_class` (`ECONOMY`/`PREMIUM_ECONOMY`/`BUSINESS`/`FIRST`, default `ECONOMY`).
+- **`routes.json`**: JSON array of route objects — the user's **personal, gitignored** config (copied from `routes.example.json`, the only tracked routes file). Loaded via `load_routes()`, which exits with a "copy routes.example.json" hint if the file is missing or not a non-empty array. Required fields: `origin`, `destination`, `departure_date` (IATA codes, ISO dates). Optional: `return_date` (presence makes it a round trip), `adults` (default 1), `non_stop` (default `true` → nonstop only), `travel_class` (`ECONOMY`/`PREMIUM_ECONOMY`/`BUSINESS`/`FIRST`, default `ECONOMY`).
 - **`state.json`**: Persisted state including `prices` (keyed by route label `"ORIGIN-DEST DATE"`, each containing `price`, `updated`, a `details` object with the cheapest offer's airlines/stops/duration plus `alternatives`/`nonstop_price`/`price_level`/`typical_price_range`, and a `history` array), `api_calls` (keyed by `YYYY-MM`), `last_run` timestamp, and `flex_scans` (keyed by `"ORIGIN-DEST"`, each holding the most recent flexible-date scan: `base_date`, `days`, per-date `results`, and the `cheapest` entry). Written atomically via a temp file + `os.replace` so a crash mid-write can't corrupt it.
 
 ## Data model (state.json)
@@ -109,7 +110,8 @@ All configuration is read from environment variables (no hardcoded credentials):
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # then fill in credentials
+cp .env.example .env              # then fill in credentials
+cp routes.example.json routes.json  # then edit your routes
 
 # Run the monitor once
 python flight_monitor.py
@@ -131,7 +133,7 @@ python app.py  # http://localhost:5000
 ## Common tasks
 
 ### Add a new route
-Edit `routes.json`. Each entry needs at minimum `origin`, `destination`, and `departure_date` (IATA codes and ISO date).
+Edit your local `routes.json` (gitignored; create it from `routes.example.json` if absent). Each entry needs at minimum `origin`, `destination`, and `departure_date` (IATA codes and ISO date).
 
 ### Find the cheapest date for a route
 Run `python flight_monitor.py --scan` (optionally `--days N`) to sweep each route's `departure_date ± N` days and report the cheapest date. On-demand only; costs one search per date and respects `MONTHLY_CALL_CAP`.
