@@ -35,6 +35,7 @@ def dashboard():
     prices = state.get("prices", {})
     api_calls = state.get("api_calls", {})
     last_run = state.get("last_run")
+    flex_scans = state.get("flex_scans", {})
 
     route_data = []
     for label, info in prices.items():
@@ -68,6 +69,7 @@ def dashboard():
         api_calls=api_calls,
         total_calls=total_calls,
         last_run=last_run,
+        flex_scans=flex_scans,
         monthly_cap=int(os.environ.get("MONTHLY_CALL_CAP", "240")),
     )
 
