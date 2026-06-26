@@ -5,7 +5,7 @@ Flight price monitor that tracks fares via the [SerpAPI Google Flights API](http
 ## How it works
 
 1. Reads routes from `routes.json`
-2. Queries SerpAPI (Google Flights) for the cheapest current fare on each route
+2. Queries SerpAPI (Google Flights) for the cheapest current fare on each route, and from the same response also records the top alternatives, the cheapest nonstop option, and Google's own price verdict (`low`/`typical`/`high` vs typical range) — all at no extra API cost
 3. Compares to the last saved price in `state.json`
 4. Sends a Telegram message when the price changes by more than `ALERT_THRESHOLD_PCT` (default 3%)
 5. Stores full price history for each route as a time-series
@@ -76,7 +76,28 @@ Add this line (adjust the path):
 0 */6 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
 ```
 
-### 6. GitHub Actions (alternative to local cron)
+### 6. Find the cheapest date (flexible-date scan)
+
+The regular monitor checks one fixed date per route. To see whether shifting your
+trip a few days is cheaper, run an on-demand scan:
+
+```bash
+python flight_monitor.py --scan            # ± 3 days around each route's date (7 searches/route)
+python flight_monitor.py --scan --days 5   # ± 5 days (11 searches/route)
+```
+
+For each route it queries every date in the window, prints a price-per-date table,
+and records the cheapest date. Round trips keep their trip length constant (the
+return date shifts by the same number of days). Results are saved to `state.json`
+under `flex_scans` and shown on the dashboard as a date grid with the best day
+highlighted; a Telegram summary is sent if alerts are configured.
+
+> **Budget note:** a scan costs one SerpAPI search *per date in the window*, so it
+> is **not** part of the 6-hour cron — run it deliberately when planning. The
+> `MONTHLY_CALL_CAP` is still enforced; an over-cap scan is refused before any
+> calls are made.
+
+### 7. GitHub Actions (alternative to local cron)
 
 If you prefer running the monitor via GitHub Actions instead of local cron, add these as repository secrets (*Settings > Secrets and variables > Actions*):
 

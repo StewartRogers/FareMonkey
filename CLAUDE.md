@@ -37,11 +37,11 @@ FareMonkey/
 
 ## Key files
 
-- **`flight_monitor.py`**: Monitor script. Reads config from env vars, loads routes from `routes.json`, queries SerpAPI Google Flights (single API key, no OAuth) for the cheapest flights, compares against `state.json`, sends Telegram alerts on significant price changes, appends to price history, and tracks API call counts per month. Maps `routes.json` fields to SerpAPI params: `travel_class` strings → integer codes (`TRAVEL_CLASS_MAP`), `non_stop` → `stops` (1 = nonstop only, 0 = any), and `return_date` presence → `type` (1 = round trip, 2 = one way). Takes the minimum price across `best_flights` and `other_flights`.
+- **`flight_monitor.py`**: Monitor script. Reads config from env vars, loads routes from `routes.json`, queries SerpAPI Google Flights (single API key, no OAuth) for the cheapest flights, compares against `state.json`, sends Telegram alerts on significant price changes, appends to price history, and tracks API call counts per month. Maps `routes.json` fields to SerpAPI params: `travel_class` strings → integer codes (`TRAVEL_CLASS_MAP`), `non_stop` → `stops` (1 = nonstop only, 0 = any), and `return_date` presence → `type` (1 = round trip, 2 = one way). Takes the minimum price across `best_flights` and `other_flights`. From the **same** (already-paid-for) response it also captures the top-3 cheapest `alternatives`, the cheapest `nonstop_price`, and the `price_insights` verdict (`price_level`, `typical_price_range`) — no extra API cost. Also supports an on-demand **flexible-date scan** via `python flight_monitor.py --scan [--days N]` (`run_scan`): for each route it searches `departure_date ± N` days (default 3 → 7 searches/route; round trips shift `return_date` by the same offset to keep trip length constant), finds the cheapest date, stores it under `state.json` → `flex_scans`, and sends a Telegram summary. The scan is **not** part of the cron — each date costs one search, so it is run deliberately and is still bounded by `MONTHLY_CALL_CAP` (an over-cap scan is refused before any calls).
 - **`app.py`**: Flask app serving the dashboard at `http://localhost:5000`. Reads `state.json` on each request. Also exposes `/api/state` as raw JSON.
-- **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, and API usage bar charts.
+- **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, a price-level verdict and cheapest alternatives per route, flexible-date scan grids, and API usage bar charts.
 - **`routes.json`**: JSON array of route objects. Required: `origin`, `destination`, `departure_date` (IATA codes, ISO dates). Optional: `return_date` (presence makes it a round trip), `adults` (default 1), `non_stop` (default `true` → nonstop only), `travel_class` (`ECONOMY`/`PREMIUM_ECONOMY`/`BUSINESS`/`FIRST`, default `ECONOMY`).
-- **`state.json`**: Persisted state including `prices` (keyed by route label `"ORIGIN-DEST DATE"`, each containing `price`, `updated`, a `details` object with the cheapest offer's airlines/stops/duration, and a `history` array), `api_calls` (keyed by `YYYY-MM`), and `last_run` timestamp. Written atomically via a temp file + `os.replace` so a crash mid-write can't corrupt it.
+- **`state.json`**: Persisted state including `prices` (keyed by route label `"ORIGIN-DEST DATE"`, each containing `price`, `updated`, a `details` object with the cheapest offer's airlines/stops/duration plus `alternatives`/`nonstop_price`/`price_level`/`typical_price_range`, and a `history` array), `api_calls` (keyed by `YYYY-MM`), `last_run` timestamp, and `flex_scans` (keyed by `"ORIGIN-DEST"`, each holding the most recent flexible-date scan: `base_date`, `days`, per-date `results`, and the `cheapest` entry). Written atomically via a temp file + `os.replace` so a crash mid-write can't corrupt it.
 
 ## Data model (state.json)
 
@@ -51,7 +51,15 @@ FareMonkey/
     "JFK-LHR 2026-09-15": {
       "price": 450.00,
       "updated": "2026-06-20T10:00:00-04:00",
-      "details": {"airlines": ["..."], "stops": 0, "total_duration": 420, "...": "..."},
+      "details": {
+        "airlines": ["..."], "stops": 0, "total_duration": 420,
+        "nonstop_price": 450.00,
+        "price_level": "low", "typical_price_range": [500, 900],
+        "alternatives": [
+          {"price": 450.00, "airlines": ["..."], "stops": 0, "total_duration": 420},
+          {"price": 470.00, "airlines": ["..."], "stops": 1, "total_duration": 540}
+        ]
+      },
       "history": [
         {"price": 480.00, "timestamp": "2026-06-19T10:00:00-04:00"},
         {"price": 450.00, "timestamp": "2026-06-20T10:00:00-04:00"}
@@ -59,7 +67,19 @@ FareMonkey/
     }
   },
   "api_calls": {"2026-06": 45},
-  "last_run": "2026-06-20T10:00:00-04:00"
+  "last_run": "2026-06-20T10:00:00-04:00",
+  "flex_scans": {
+    "JFK-LHR": {
+      "scanned": "2026-06-20T09:00:00-04:00",
+      "base_date": "2026-09-15",
+      "days": 3,
+      "results": [
+        {"date": "2026-09-14", "return_date": null, "price": 470.00},
+        {"date": "2026-09-15", "return_date": null, "price": 450.00}
+      ],
+      "cheapest": {"date": "2026-09-15", "return_date": null, "price": 450.00}
+    }
+  }
 }
 ```
 
@@ -108,6 +128,9 @@ python app.py  # http://localhost:5000
 
 ### Add a new route
 Edit `routes.json`. Each entry needs at minimum `origin`, `destination`, and `departure_date` (IATA codes and ISO date).
+
+### Find the cheapest date for a route
+Run `python flight_monitor.py --scan` (optionally `--days N`) to sweep each route's `departure_date ± N` days and report the cheapest date. On-demand only; costs one search per date and respects `MONTHLY_CALL_CAP`.
 
 ### Change alert sensitivity
 Set the `ALERT_THRESHOLD_PCT` environment variable. Lower = more alerts.

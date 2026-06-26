@@ -7,7 +7,7 @@ import json
 import os
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
@@ -136,6 +136,21 @@ def _extract_details(flight: dict) -> dict:
     }
 
 
+def _summarize(flight: dict) -> dict:
+    """Compact summary of one offer, for the alternatives list."""
+    airlines: list[str] = []
+    for seg in flight.get("flights", []):
+        airline = seg.get("airline")
+        if airline and airline not in airlines:
+            airlines.append(airline)
+    return {
+        "price": float(flight["price"]),
+        "airlines": airlines,
+        "stops": len(flight.get("layovers", [])),
+        "total_duration": flight.get("total_duration"),
+    }
+
+
 def search_cheapest(route: dict) -> dict | None:
     """Return the cheapest option (price + details) for a route, or None on failure."""
     travel_class = TRAVEL_CLASS_MAP.get(
@@ -178,9 +193,25 @@ def search_cheapest(route: dict) -> dict | None:
     if not candidates:
         return None
 
-    cheapest = min(candidates, key=lambda f: f["price"])
+    candidates.sort(key=lambda f: f["price"])
+    cheapest = candidates[0]
     offer = {"price": float(cheapest["price"])}
     offer.update(_extract_details(cheapest))
+
+    # A single search already returns the full result set and Google's own price
+    # assessment — capture it instead of discarding everything but the minimum.
+    offer["alternatives"] = [_summarize(f) for f in candidates[:3]]
+
+    # Cheapest nonstop option (so we can show the nonstop premium when a route
+    # allows connections). When the route is nonstop-only this equals the price.
+    nonstop = [f for f in candidates if not f.get("layovers")]
+    offer["nonstop_price"] = float(nonstop[0]["price"]) if nonstop else None
+
+    # Google Flights' own verdict for this query (no extra API cost).
+    insights = data.get("price_insights") or {}
+    offer["price_level"] = insights.get("price_level")
+    offer["typical_price_range"] = insights.get("typical_price_range")
+
     return offer
 
 
@@ -193,6 +224,9 @@ def format_offer(offer: dict) -> str:
     dur = offer.get("total_duration")
     if dur:
         parts.append(f"{dur // 60}h {dur % 60:02d}m")
+    level = offer.get("price_level")
+    if level:
+        parts.append(f"{level} vs typical")
     return " · ".join(parts)
 
 
@@ -229,11 +263,119 @@ def send_telegram(message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Flexible-date scan (on-demand)
+# ---------------------------------------------------------------------------
+
+
+def run_scan(days: int) -> None:
+    """Scan each route across departure_date ± `days` to find the cheapest date.
+
+    On-demand only (not part of the 6-hour cron): each date in the window costs
+    one SerpAPI search, so a 7-day window for one route spends 7 searches. The
+    monthly cap is still enforced. Round trips shift the return date by the same
+    offset so the trip length stays constant.
+    """
+    if not SERPAPI_API_KEY:
+        sys.exit("Error: SERPAPI_API_KEY must be set.")
+
+    routes = load_json(ROUTES_FILE)
+    if not isinstance(routes, list) or not routes:
+        sys.exit("Error: routes.json must contain a non-empty JSON array.")
+
+    state = load_json(STATE_FILE)
+    offsets = list(range(-days, days + 1))
+    needed = len(routes) * len(offsets)
+    if not can_make_calls(state, needed):
+        sys.exit(
+            f"Monthly cap would be exceeded ({get_call_count(state)}/{MONTHLY_CALL_CAP}). "
+            f"A {len(offsets)}-day scan of {len(routes)} route(s) needs {needed} searches. "
+            f"Lower --days or wait for the next month."
+        )
+
+    flex = state.setdefault("flex_scans", {})
+    now_str = current_local_time().isoformat()
+    print(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
+
+    for route in routes:
+        label = f"{route['origin']}-{route['destination']}"
+        base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
+        base_ret = (
+            datetime.strptime(route["return_date"], "%Y-%m-%d").date()
+            if route.get("return_date")
+            else None
+        )
+        print(f"Scanning {label} around {base_dep.isoformat()} ...")
+
+        results: list[dict] = []
+        for off in offsets:
+            dep = base_dep + timedelta(days=off)
+            probe = dict(route)
+            probe["departure_date"] = dep.isoformat()
+            if base_ret is not None:
+                probe["return_date"] = (base_ret + timedelta(days=off)).isoformat()
+
+            offer = search_cheapest(probe)
+            increment_call_count(state, 1)
+            price = offer["price"] if offer else None
+            results.append(
+                {
+                    "date": dep.isoformat(),
+                    "return_date": probe.get("return_date"),
+                    "price": price,
+                }
+            )
+            marker = "  ← base" if off == 0 else ""
+            price_str = f"{CURRENCY} {price:.2f}" if price is not None else "no offers"
+            print(f"  {dep.isoformat()}: {price_str}{marker}")
+
+        priced = [r for r in results if r["price"] is not None]
+        cheapest = min(priced, key=lambda r: r["price"]) if priced else None
+        base = next((r for r in results if r["date"] == base_dep.isoformat()), None)
+        flex[label] = {
+            "scanned": now_str,
+            "base_date": base_dep.isoformat(),
+            "days": days,
+            "results": results,
+            "cheapest": cheapest,
+        }
+
+        if cheapest:
+            saving = ""
+            if base and base["price"] is not None and cheapest["date"] != base["date"]:
+                diff = base["price"] - cheapest["price"]
+                if diff > 0:
+                    saving = f" (saves {CURRENCY} {diff:.2f} vs {base['date']})"
+            print(f"  Cheapest: {cheapest['date']} at {CURRENCY} {cheapest['price']:.2f}{saving}\n")
+            send_telegram(
+                f"📅 *{label}* date scan (±{days}d)\n"
+                f"Cheapest: {cheapest['date']} — {CURRENCY} {cheapest['price']:.2f}{saving}"
+            )
+        else:
+            print("  No offers found in window.\n")
+
+    save_json(STATE_FILE, state)
+    print(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--scan":
+        days = 3
+        if "--days" in argv:
+            try:
+                days = int(argv[argv.index("--days") + 1])
+            except (IndexError, ValueError):
+                sys.exit("Error: --days requires an integer, e.g. --scan --days 5")
+        if days < 1:
+            sys.exit("Error: --days must be >= 1")
+        run_scan(days)
+        return
+
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
 
