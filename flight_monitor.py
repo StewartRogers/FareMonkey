@@ -19,6 +19,15 @@ try:
 except ImportError:
     pass  # python-dotenv is optional; cron/CI inject env vars directly
 
+# Cron and CI frequently run under a non-UTF-8 locale (e.g. latin-1), which makes
+# print() raise UnicodeEncodeError on the emoji/en-dash characters used below.
+# Force UTF-8 on the output streams so logging can't crash the monitor.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # already UTF-8, or a stream that doesn't support reconfigure
+
 # ---------------------------------------------------------------------------
 # Configuration from environment
 # ---------------------------------------------------------------------------
@@ -59,8 +68,13 @@ TRAVEL_CLASS_MAP = {
 
 def load_json(path: Path) -> dict:
     if path.exists():
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (ValueError, OSError) as e:
+            # Fail loudly rather than returning {} — a silent empty dict would
+            # wipe price history / api_calls on the next save_json.
+            sys.exit(f"Error: could not read {path.name}: {e}")
     return {}
 
 
@@ -92,6 +106,18 @@ def current_local_time() -> datetime:
 
     tz = zoneinfo.ZoneInfo(TIMEZONE)
     return datetime.now(tz)
+
+
+def log(msg: str = "") -> None:
+    """Print a timestamped log line (in the configured TIMEZONE).
+
+    Blank calls stay blank so spacing between sections is preserved.
+    """
+    if not msg:
+        print()
+        return
+    ts = current_local_time().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{ts}  {msg}")
 
 
 def is_within_active_hours() -> bool:
@@ -187,7 +213,7 @@ def archive_response(route: dict, params: dict, data: dict) -> None:
         with open(RESPONSES_FILE, "a") as f:
             f.write(json.dumps(record) + "\n")
     except OSError as e:
-        print(f"  [archive error] {e}")
+        log(f"  [archive error] {e}")
 
 
 def _is_older_than(timestamp: str, cutoff: datetime) -> bool:
@@ -277,15 +303,25 @@ def search_cheapest(route: dict) -> dict | None:
     if has_return:
         params["return_date"] = route["return_date"]
 
-    resp = requests.get(SERPAPI_BASE, params=params, timeout=30)
+    try:
+        resp = requests.get(SERPAPI_BASE, params=params, timeout=30)
+    except requests.RequestException as e:
+        # A transient network failure must not abort the whole run — skip this
+        # route and let the remaining ones still be checked.
+        log(f"  Request failed: {e}")
+        return None
     if resp.status_code != 200:
-        print(f"  API error {resp.status_code}: {resp.text[:200]}")
+        log(f"  API error {resp.status_code}: {resp.text[:200]}")
         return None
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except ValueError as e:  # 200 OK but body isn't JSON (e.g. an HTML error page)
+        log(f"  Invalid JSON from API: {e}")
+        return None
     archive_response(route, params, data)
     if data.get("error"):
-        print(f"  API error: {data['error']}")
+        log(f"  API error: {data['error']}")
         return None
 
     candidates = [
@@ -341,7 +377,7 @@ def format_offer(offer: dict) -> str:
 
 def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"  [Telegram disabled] {message}")
+        log(f"  [Telegram disabled] {message}")
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -354,16 +390,16 @@ def send_telegram(message: str) -> None:
         # Telegram returns HTTP 200 with ok=false on Markdown parse errors caused by
         # unescaped *, _, ` or [ in dynamic text (airline names, labels). Retry as
         # plain text so the alert still lands instead of being silently dropped.
-        print(f"  [Telegram error] {body.get('description')}; retrying without Markdown")
+        log(f"  [Telegram error] {body.get('description')}; retrying without Markdown")
         payload.pop("parse_mode", None)
         resp = requests.post(url, json=payload, timeout=15)
         body = resp.json()
         if not body.get("ok"):
-            print(f"  [Telegram error] {body.get('description')}")
+            log(f"  [Telegram error] {body.get('description')}")
     except requests.RequestException as e:
-        print(f"  [Telegram error] {e}")
+        log(f"  [Telegram error] {e}")
     except ValueError as e:  # non-JSON response body
-        print(f"  [Telegram error] invalid response: {e}")
+        log(f"  [Telegram error] invalid response: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +432,7 @@ def run_scan(days: int) -> None:
 
     flex = state.setdefault("flex_scans", {})
     now_str = current_local_time().isoformat()
-    print(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
+    log(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
 
     for route in routes:
         base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
@@ -409,7 +445,7 @@ def run_scan(days: int) -> None:
         # routes sharing an origin/destination but differing by date don't
         # collide and overwrite each other in flex_scans.
         label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
-        print(f"Scanning {label} ...")
+        log(f"Scanning {label} ...")
 
         results: list[dict] = []
         for off in offsets:
@@ -431,7 +467,7 @@ def run_scan(days: int) -> None:
             )
             marker = "  ← base" if off == 0 else ""
             price_str = f"{CURRENCY} {price:.2f}" if price is not None else "no offers"
-            print(f"  {dep.isoformat()}: {price_str}{marker}")
+            log(f"  {dep.isoformat()}: {price_str}{marker}")
 
         priced = [r for r in results if r["price"] is not None]
         cheapest = min(priced, key=lambda r: r["price"]) if priced else None
@@ -450,16 +486,16 @@ def run_scan(days: int) -> None:
                 diff = base["price"] - cheapest["price"]
                 if diff > 0:
                     saving = f" (saves {CURRENCY} {diff:.2f} vs {base['date']})"
-            print(f"  Cheapest: {cheapest['date']} at {CURRENCY} {cheapest['price']:.2f}{saving}\n")
+            log(f"  Cheapest: {cheapest['date']} at {CURRENCY} {cheapest['price']:.2f}{saving}\n")
             send_telegram(
                 f"📅 *{label}* date scan (±{days}d)\n"
                 f"Cheapest: {cheapest['date']} — {CURRENCY} {cheapest['price']:.2f}{saving}"
             )
         else:
-            print("  No offers found in window.\n")
+            log("  No offers found in window.\n")
 
     save_json(STATE_FILE, state)
-    print(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
+    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
 
 
 # ---------------------------------------------------------------------------
@@ -485,7 +521,7 @@ def run_trim(days: int) -> None:
     state = load_json(STATE_FILE)
     hist_removed, resp_removed = trim_old_data(state, days)
     save_json(STATE_FILE, state)
-    print(
+    log(
         f"Trimmed to last {days} days: removed {hist_removed} history point(s) "
         f"and {resp_removed} archived response(s)."
     )
@@ -504,7 +540,7 @@ def main() -> None:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
 
     if not is_within_active_hours():
-        print(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
+        log(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
         return
 
     routes = load_routes()
@@ -514,7 +550,7 @@ def main() -> None:
     # 1 search call per route (SerpAPI uses a single API key, no token call)
     calls_needed = len(routes)
     if not can_make_calls(state, calls_needed):
-        print(
+        log(
             f"Monthly cap would be exceeded ({get_call_count(state)}/{MONTHLY_CALL_CAP}). "
             f"Need {calls_needed} calls. Skipping."
         )
@@ -526,13 +562,13 @@ def main() -> None:
 
     for route in routes:
         label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
-        print(f"Checking {label} ...")
+        log(f"Checking {label} ...")
 
         offer = search_cheapest(route)
         increment_call_count(state, 1)
 
         if offer is None:
-            print(f"  No offers found for {label}")
+            log(f"  No offers found for {label}")
             continue
 
         price = offer["price"]
@@ -544,8 +580,8 @@ def main() -> None:
         if len(history) > MAX_HISTORY:
             history = history[-MAX_HISTORY:]
         prices[label] = {"price": price, "updated": now_str, "details": details, "history": history}
-        print(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else ""))
-        print(f"  {format_offer(offer)}")
+        log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else ""))
+        log(f"  {format_offer(offer)}")
 
         pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
         significant = pct_change is not None and abs(pct_change) >= ALERT_THRESHOLD_PCT
@@ -553,7 +589,7 @@ def main() -> None:
         if pct_change is None:
             icon = "🐒"
             change_line = f"Baseline: {CURRENCY} {price:.2f}"
-            print("  First check — baseline recorded.")
+            log("  First check — baseline recorded.")
         elif pct_change <= -ALERT_THRESHOLD_PCT:
             icon = "✈️"
             change_line = f"Price *dropped {abs(pct_change):.1f}%*: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
@@ -582,11 +618,11 @@ def main() -> None:
     hist_removed, resp_removed = trim_old_data(state, RETENTION_DAYS)
     save_json(STATE_FILE, state)
     if hist_removed or resp_removed:
-        print(
+        log(
             f"Trimmed {hist_removed} history point(s) and {resp_removed} "
             f"archived response(s) older than {RETENTION_DAYS} days."
         )
-    print(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
+    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
 
 
 if __name__ == "__main__":
