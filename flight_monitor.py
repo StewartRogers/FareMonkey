@@ -43,6 +43,8 @@ ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3"))
 NOTIFY_EVERY_RUN = os.environ.get("NOTIFY_EVERY_RUN", "true").lower() in ("1", "true", "yes", "on")
 MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "240"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "1000"))
+# When true, drop any itinerary that connects through a US airport (see US_HUBS).
+EXCLUDE_US_CONNECTIONS = os.environ.get("EXCLUDE_US_CONNECTIONS", "false").lower() in ("1", "true", "yes", "on")
 ARCHIVE_RESPONSES = os.environ.get("ARCHIVE_RESPONSES", "true").lower() in ("1", "true", "yes", "on")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 
@@ -60,6 +62,26 @@ TRAVEL_CLASS_MAP = {
     "BUSINESS": 3,
     "FIRST": 4,
 }
+
+# Major US connecting hubs, used to drop itineraries that layover in the US when
+# EXCLUDE_US_CONNECTIONS is on. Not every US airport — just the ones that realistically
+# appear as connection points. Add codes here if you see a US layover slip through.
+US_HUBS = {
+    # West
+    "SEA", "PDX", "SFO", "OAK", "SJC", "LAX", "SAN", "LAS", "PHX", "SLC", "DEN",
+    # Central / South-central
+    "DFW", "IAH", "AUS", "MSP", "ORD", "MDW", "STL", "MCI", "MSY", "BNA", "MEM",
+    # Southeast
+    "ATL", "CLT", "MIA", "FLL", "MCO", "TPA", "RDU", "RSW",
+    # Northeast / Mid-Atlantic
+    "JFK", "EWR", "LGA", "BOS", "PHL", "BWI", "IAD", "DCA", "PIT", "CLE", "DTW",
+    # Other commonly-seen
+    "HNL", "ANC", "SAT", "SMF", "ONT", "BUR", "CVG", "IND", "CMH",
+}
+
+# Set once per process after a quota/credits alert is sent, so a run that hits the
+# limit on every route only pings Telegram once instead of per route.
+_QUOTA_ALERTED = False
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -125,6 +147,20 @@ def is_within_active_hours() -> bool:
     return ACTIVE_START <= now.hour < ACTIVE_END
 
 
+def route_runs_this_hour(route: dict, hour: int) -> bool:
+    """Decide whether a route should be checked on the current cron firing.
+
+    A route may set an optional ``run_hours`` list (local-time hours) to limit
+    which firings it runs on — e.g. ``"run_hours": [13]`` checks once a day on the
+    13:xx firing. Without ``run_hours`` the route runs on every firing (the
+    default). The values must match the hours the cron actually fires at.
+    """
+    run_hours = route.get("run_hours")
+    if run_hours is None:
+        return True
+    return hour in run_hours
+
+
 def month_key() -> str:
     return current_local_time().strftime("%Y-%m")
 
@@ -151,6 +187,18 @@ def can_make_calls(state: dict, needed: int) -> bool:
 # ---------------------------------------------------------------------------
 # SerpAPI Google Flights
 # ---------------------------------------------------------------------------
+
+
+def _has_us_layover(flight: dict) -> bool:
+    """True if any layover (connection) airport is a known US hub (see US_HUBS).
+
+    Only connection airports are checked — the origin and destination are ignored,
+    so a US-bound or US-origin route isn't excluded, only ones that *transit* the US.
+    """
+    return any(
+        (lo.get("id") or "").upper() in US_HUBS
+        for lo in flight.get("layovers", [])
+    )
 
 
 def _extract_details(flight: dict) -> dict:
@@ -280,6 +328,40 @@ def trim_old_data(state: dict, days: int) -> tuple[int, int]:
     return trim_history(state, cutoff), trim_responses(cutoff)
 
 
+def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
+    """If an API failure looks like exhausted SerpAPI searches, alert via Telegram.
+
+    Returns True when the failure was identified as a quota/credits problem.
+    HTTP 429 or a message mentioning running out of / exceeding searches both count.
+    Only the first such failure per process sends an alert (see ``_QUOTA_ALERTED``)
+    so a fully-exhausted account doesn't fire one Telegram message per route.
+    """
+    global _QUOTA_ALERTED
+    text = (message or "").lower()
+    is_quota = status == 429 or any(
+        kw in text
+        for kw in (
+            "run out of searches",
+            "ran out of searches",
+            "out of searches",
+            "searches per month",
+            "exceeded your",
+            "run out of",
+            "upgrade your plan",
+        )
+    )
+    if not is_quota:
+        return False
+    if not _QUOTA_ALERTED:
+        _QUOTA_ALERTED = True
+        send_telegram(
+            "🚨 *FareMonkey: SerpAPI searches exhausted*\n"
+            f"Could not check *{label}* — your SerpAPI plan appears to be out of "
+            f"searches.\n`{(message or '').strip()[:300]}`"
+        )
+    return True
+
+
 def search_cheapest(route: dict) -> dict | None:
     """Return the cheapest option (price + details) for a route, or None on failure."""
     travel_class = TRAVEL_CLASS_MAP.get(
@@ -312,6 +394,8 @@ def search_cheapest(route: dict) -> dict | None:
         return None
     if resp.status_code != 200:
         log(f"  API error {resp.status_code}: {resp.text[:200]}")
+        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
+        _maybe_alert_quota(label, resp.status_code, resp.text)
         return None
 
     try:
@@ -322,6 +406,8 @@ def search_cheapest(route: dict) -> dict | None:
     archive_response(route, params, data)
     if data.get("error"):
         log(f"  API error: {data['error']}")
+        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
+        _maybe_alert_quota(label, resp.status_code, str(data["error"]))
         return None
 
     candidates = [
@@ -332,6 +418,16 @@ def search_cheapest(route: dict) -> dict | None:
     ]
     if not candidates:
         return None
+
+    if EXCLUDE_US_CONNECTIONS:
+        kept = [f for f in candidates if not _has_us_layover(f)]
+        dropped = len(candidates) - len(kept)
+        if dropped:
+            log(f"  Excluded {dropped} itinerary(ies) connecting through a US airport.")
+        candidates = kept
+        if not candidates:
+            log("  No itineraries left after excluding US connections.")
+            return None
 
     candidates.sort(key=lambda f: f["price"])
     cheapest = candidates[0]
@@ -410,7 +506,7 @@ def send_telegram(message: str) -> None:
 def run_scan(days: int) -> None:
     """Scan each route across departure_date ± `days` to find the cheapest date.
 
-    On-demand only (not part of the 6-hour cron): each date in the window costs
+    On-demand only (not part of the scheduled cron): each date in the window costs
     one SerpAPI search, so a 7-day window for one route spends 7 searches. The
     monthly cap is still enforced. Round trips shift the return date by the same
     offset so the trip length stays constant.
@@ -543,7 +639,18 @@ def main() -> None:
         log(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
         return
 
-    routes = load_routes()
+    all_routes = load_routes()
+
+    # Some routes opt into a reduced schedule via "run_hours"; skip the ones that
+    # aren't scheduled for this firing so they don't spend a search.
+    this_hour = current_local_time().hour
+    routes = [r for r in all_routes if route_runs_this_hour(r, this_hour)]
+    skipped = len(all_routes) - len(routes)
+    if skipped:
+        log(f"Skipping {skipped} route(s) not scheduled for the {this_hour}:00 firing.")
+    if not routes:
+        log("No routes scheduled for this firing. Nothing to do.")
+        return
 
     state = load_json(STATE_FILE)
 
@@ -554,6 +661,16 @@ def main() -> None:
             f"Monthly cap would be exceeded ({get_call_count(state)}/{MONTHLY_CALL_CAP}). "
             f"Need {calls_needed} calls. Skipping."
         )
+        # Notify once per month so you know checks have paused, without spamming on
+        # every subsequent run until the counter resets.
+        if state.get("cap_alert_month") != month_key():
+            state["cap_alert_month"] = month_key()
+            send_telegram(
+                "⛔ *FareMonkey: monthly search cap reached*\n"
+                f"{get_call_count(state)}/{MONTHLY_CALL_CAP} searches used this month "
+                f"({month_key()}). Price checks are paused until next month or until "
+                "you raise `MONTHLY_CALL_CAP`."
+            )
         save_json(STATE_FILE, state)
         return
 
