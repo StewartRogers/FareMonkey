@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-FareMonkey is a Python-based flight price monitor with a web dashboard. It queries the SerpAPI Google Flights API for the cheapest fares on configured routes, compares prices to previously recorded values, sends Telegram alerts when prices change beyond a configurable threshold, and stores full price history for visualization in a Flask dashboard. It runs every 6 hours via local cron. `state.json` and `responses.jsonl` are kept **local only** (gitignored) and are never committed to the repo.
+FareMonkey is a Python-based flight price monitor with a web dashboard. It queries the SerpAPI Google Flights API for the cheapest fares on configured routes, compares prices to previously recorded values, sends Telegram alerts when prices change beyond a configurable threshold, and stores full price history for visualization in a Flask dashboard. It runs 3 times a day (at 7:30, 13:30, 19:30 — 6 hours apart, all within active hours) via local cron. `state.json` and `responses.jsonl` are kept **local only** (gitignored) and are never committed to the repo.
 
 ## Tech stack
 
@@ -105,6 +105,7 @@ All configuration is read from environment variables (no hardcoded credentials):
 | `MAX_HISTORY` | No | `1000` | Max price history entries kept per route |
 | `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
 | `RETENTION_DAYS` | No | `30` | Prune history points and archived responses older than this (each run) |
+| `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that layover in a US airport (matched against the `US_HUBS` set). Origin/destination are not checked, only connections. |
 
 ## Running locally
 
@@ -152,7 +153,7 @@ Use a WSGI server: `pip install gunicorn && gunicorn app:app -b 0.0.0.0:5000`
 
 ## Guardrails
 
-- The `MONTHLY_CALL_CAP` (default 240) leaves a small buffer below the user's 250-search/month SerpAPI plan. Each run costs 1 search per route (no separate token call). Do not raise it above the user's plan limit. Run the monitor no more than every 6 hours (not hourly) to stay within budget — hourly checks would far exceed 250/month.
+- The `MONTHLY_CALL_CAP` (default 240) leaves a buffer below the user's 250-search/month SerpAPI plan. Each run costs 1 search per route (no separate token call). Do not raise it above the user's plan limit. The local cron runs 3 times a day at 7:30/13:30/19:30 (`30 7,13,19 * * *`) — 6 hours apart and all inside the default active-hours window (`ACTIVE_START=7`, `ACTIVE_END=22`). A plain `0 */6 * * *` schedule would fire at 00:00 and 06:00, which the monitor self-skips as outside active hours, wasting two firings. Do not run the monitor hourly — that would far exceed 250/month.
 - `state.json` and `responses.jsonl` are runtime data, kept **local only** (gitignored). They are never committed or pushed to the repo. The monitor runs locally (e.g. cron on a Raspberry Pi); the GitHub Actions workflow is manual-only (`workflow_dispatch`), has no `schedule`, and commits nothing — so it cannot push data or double-spend the SerpAPI budget against the local cron.
 - Credentials are stored as GitHub repository secrets or in `.env` (gitignored), never in code.
 - The Flask dashboard binds to `127.0.0.1:5000` with `debug=True` in dev mode (`app.py`). For production or LAN access, use gunicorn behind a reverse proxy (gunicorn's `-b 0.0.0.0:5000` exposes it on all interfaces).

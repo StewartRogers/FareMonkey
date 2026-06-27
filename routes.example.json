@@ -14,6 +14,7 @@
     "departure_date": "2026-10-05",
     "adults": 2,
     "non_stop": false,
-    "travel_class": "PREMIUM_ECONOMY"
+    "travel_class": "PREMIUM_ECONOMY",
+    "run_hours": [13]
   }
 ]

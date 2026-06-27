@@ -70,7 +70,7 @@ One-off:
 python flight_monitor.py
 ```
 
-Set up a cron job on your Linux server (every 6 hours to stay within the SerpAPI search budget):
+Set up a cron job on your Linux server (3 runs/day, 6 hours apart, to stay within the SerpAPI search budget):
 
 ```bash
 crontab -e
@@ -79,8 +79,14 @@ crontab -e
 Add this line (adjust the path):
 
 ```
-0 */6 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
+30 7,13,19 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
 ```
+
+The runs fire at **7:30, 13:30, and 19:30** so they all fall inside the default
+active-hours window (`ACTIVE_START=7`, `ACTIVE_END=22`). A plain `0 */6 * * *`
+schedule would fire at 00:00 and 06:00 too, but the monitor self-skips those
+because they're outside active hours — wasting two of the four daily firings. If
+you widen the active window, adjust these times to match.
 
 ### 6. Find the cheapest date (flexible-date scan)
 
@@ -99,7 +105,7 @@ under `flex_scans` and shown on the dashboard as a date grid with the best day
 highlighted; a Telegram summary is sent if alerts are configured.
 
 > **Budget note:** a scan costs one SerpAPI search *per date in the window*, so it
-> is **not** part of the 6-hour cron — run it deliberately when planning. The
+> is **not** part of the scheduled cron — run it deliberately when planning. The
 > `MONTHLY_CALL_CAP` is still enforced; an over-cap scan is refused before any
 > calls are made.
 
@@ -146,6 +152,7 @@ Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*.
 | `MAX_HISTORY` | No | `1000` | Max price history entries kept per route |
 | `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
 | `RETENTION_DAYS` | No | `30` | Prune history and archived responses older than this (each run) |
+| `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that connect through a US airport (nonstop and non-US connections kept) |
 
 ## Data archive & retention
 
@@ -166,13 +173,13 @@ SerpAPI charges **1 search per route per run** — there is no separate token/au
 |----------|-------|
 | Flight search (per route) | 1 per run |
 | **Total per run** (2 routes) | **2** |
-| Runs per day (every 6 hours) | **4** |
-| **Calls per day** | **8** |
-| **Calls per month** (30 days) | **~240** |
+| Runs per day (7:30, 13:30, 19:30) | **3** |
+| **Calls per day** | **6** |
+| **Calls per month** (30 days) | **~180** |
 
-The default `MONTHLY_CALL_CAP=240` leaves a small buffer below a 250-search/month plan. The monitor stops making calls once the cap is reached; the cap is tracked in `state.json` and resets each calendar month.
+The default `MONTHLY_CALL_CAP=240` leaves a comfortable buffer below a 250-search/month plan. The monitor stops making calls once the cap is reached; the cap is tracked in `state.json` and resets each calendar month.
 
-**Be economical**: hourly checks would burn ~1,440 searches/month with 2 routes — far above 250. The workflow therefore runs **every 6 hours** (`0 */6 * * *`). To adjust your budget: change the cron interval, narrow the active-hours window, reduce the number of routes, or raise `MONTHLY_CALL_CAP` if you upgrade your SerpAPI plan.
+**Be economical**: hourly checks would burn ~1,440 searches/month with 2 routes — far above 250. The cron therefore runs **3 times a day, 6 hours apart** (`30 7,13,19 * * *`), all within active hours. To adjust your budget: change the cron interval, narrow the active-hours window, reduce the number of routes, or raise `MONTHLY_CALL_CAP` if you upgrade your SerpAPI plan.
 
 ## Files
 
