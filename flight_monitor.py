@@ -83,6 +83,11 @@ US_HUBS = {
 # limit on every route only pings Telegram once instead of per route.
 _QUOTA_ALERTED = False
 
+# Live remaining-searches counter, synced from the SerpAPI account endpoint at
+# process start and decremented locally after every search.  None means no sync
+# has happened yet (the account call failed or was skipped).
+_searches_left: int | None = None
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -182,6 +187,53 @@ def increment_call_count(state: dict, n: int = 1) -> None:
 
 def can_make_calls(state: dict, needed: int) -> bool:
     return get_call_count(state) + needed <= MONTHLY_CALL_CAP
+
+
+def sync_account_quota() -> int | None:
+    """Fetch remaining searches from the SerpAPI account endpoint.
+
+    Called once per process (on startup) to seed ``_searches_left``.  Returns
+    the number of plan searches remaining, or None on failure.  This call does
+    **not** consume a search credit.
+    """
+    global _searches_left
+    url = "https://serpapi.com/account.json"
+    try:
+        resp = requests.get(url, params={"api_key": SERPAPI_API_KEY}, timeout=10)
+        if resp.status_code != 200:
+            log(f"  Account sync failed (HTTP {resp.status_code})")
+            return None
+        data = resp.json()
+        left = data.get("plan_searches_left")
+        if left is None:
+            left = data.get("searches_left")
+        if left is None:
+            total = data.get("total_searches_left")
+            if total is not None:
+                left = total
+        if left is not None:
+            _searches_left = int(left)
+            log(f"SerpAPI account synced: {_searches_left} searches remaining")
+            return _searches_left
+        log(f"  Account sync: could not find searches_left in response")
+        return None
+    except (requests.RequestException, ValueError, KeyError) as e:
+        log(f"  Account sync failed: {e}")
+        return None
+
+
+def decrement_searches_left() -> None:
+    """Decrement the local remaining-searches counter after a search call."""
+    global _searches_left
+    if _searches_left is not None:
+        _searches_left -= 1
+
+
+def log_searches_left() -> str:
+    """Return a short string showing remaining SerpAPI searches, for log lines."""
+    if _searches_left is not None:
+        return f" [{_searches_left} left on plan]"
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -392,8 +444,10 @@ def search_cheapest(route: dict) -> dict | None:
         # route and let the remaining ones still be checked.
         log(f"  Request failed: {e}")
         return None
+    # A search credit is consumed once the API returns, regardless of status.
+    decrement_searches_left()
     if resp.status_code != 200:
-        log(f"  API error {resp.status_code}: {resp.text[:200]}")
+        log(f"  API error {resp.status_code}: {resp.text[:200]}{log_searches_left()}")
         label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
         _maybe_alert_quota(label, resp.status_code, resp.text)
         return None
@@ -600,6 +654,7 @@ def run_scan(days: int) -> None:
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
 
+    sync_account_quota()
     routes = load_routes()
 
     state = load_json(STATE_FILE)
@@ -649,7 +704,7 @@ def run_scan(days: int) -> None:
             )
             marker = "  ← base" if off == 0 else ""
             price_str = f"{CURRENCY} {price:.2f}" if price is not None else "no offers"
-            log(f"  {dep.isoformat()}: {price_str}{marker}")
+            log(f"  {dep.isoformat()}: {price_str}{marker}{log_searches_left()}")
 
         priced = [r for r in results if r["price"] is not None]
         cheapest = min(priced, key=lambda r: r["price"]) if priced else None
@@ -677,7 +732,7 @@ def run_scan(days: int) -> None:
             log("  No offers found in window.\n")
 
     save_json(STATE_FILE, state)
-    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
+    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}{log_searches_left()}")
 
 
 # ---------------------------------------------------------------------------
@@ -720,6 +775,8 @@ def main() -> None:
 
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
+
+    sync_account_quota()
 
     if not is_within_active_hours():
         log(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
@@ -783,7 +840,7 @@ def main() -> None:
         if len(history) > MAX_HISTORY:
             history = history[-MAX_HISTORY:]
         prices[label] = {"price": price, "updated": now_str, "details": details, "history": history}
-        log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else ""))
+        log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else "") + log_searches_left())
         log(f"  {format_offer(offer)}")
 
         pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
@@ -815,7 +872,7 @@ def main() -> None:
             f"Trimmed {hist_removed} history point(s) and {resp_removed} "
             f"archived response(s) older than {RETENTION_DAYS} days."
         )
-    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}")
+    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}{log_searches_left()}")
 
 
 if __name__ == "__main__":
