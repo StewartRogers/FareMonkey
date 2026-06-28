@@ -451,8 +451,34 @@ def search_cheapest(route: dict) -> dict | None:
     return offer
 
 
+def _format_price(amount: float) -> str:
+    """Format price with comma grouping; drop decimals when whole."""
+    return f"{amount:,.0f}" if amount == int(amount) else f"{amount:,.2f}"
+
+
+def _overnight(dep_raw: str | None, arr_raw: str | None) -> str:
+    """Return ' (+1)' / ' (+2)' etc. when arrival is a later calendar day."""
+    if not dep_raw or not arr_raw:
+        return ""
+    try:
+        dep = datetime.strptime(dep_raw, "%Y-%m-%d %H:%M")
+        arr = datetime.strptime(arr_raw, "%Y-%m-%d %H:%M")
+        diff = (arr.date() - dep.date()).days
+        return f" (+{diff})" if diff > 0 else ""
+    except ValueError:
+        return ""
+
+
+def _format_date(iso: str) -> str:
+    """'2026-12-30' → 'Dec 30'."""
+    try:
+        return datetime.strptime(iso, "%Y-%m-%d").strftime("%b %d")
+    except ValueError:
+        return iso
+
+
 def format_offer(offer: dict) -> str:
-    """One-line summary of a flight offer for console/Telegram output."""
+    """One-line summary for console logging."""
     airlines = ", ".join(offer.get("airlines") or []) or "?"
     stops = offer.get("stops", 0)
     stops_str = "nonstop" if stops == 0 else f"{stops} stop{'s' if stops > 1 else ''}"
@@ -464,6 +490,66 @@ def format_offer(offer: dict) -> str:
     if level:
         parts.append(f"{level} vs typical")
     return " · ".join(parts)
+
+
+def format_telegram(route: dict, offer: dict, icon: str,
+                    pct_change: float | None) -> str:
+    """Build the full Telegram alert message for a route check."""
+    price = offer["price"]
+    adults = route.get("adults", 1)
+    header = f"{icon} {route['origin']} → {route['destination']} ({adults} pax)"
+
+    # Price + change + flight summary — all on one line
+    price_str = f"{CURRENCY} {_format_price(price)}"
+    if pct_change is not None and pct_change != 0:
+        arrow = "↓" if pct_change < 0 else "↑"
+        price_str += f" ({arrow}{abs(pct_change):.1f}%)"
+    parts = [price_str]
+    level = offer.get("price_level")
+    if level:
+        parts.append(f"{level} vs typical")
+    airlines = ", ".join(offer.get("airlines") or []) or "?"
+    parts.append(airlines)
+    stops = offer.get("stops", 0)
+    layovers = offer.get("layover_airports") or []
+    if stops == 0:
+        parts.append("nonstop")
+    elif layovers:
+        parts.append(f"{stops} stop {'→'.join(layovers)}")
+    else:
+        parts.append(f"{stops} stop{'s' if stops > 1 else ''}")
+    dur = offer.get("total_duration")
+    if dur:
+        parts.append(f"{dur // 60}h {dur % 60:02d}m")
+    summary = " · ".join(parts)
+
+    # Outbound itinerary
+    dep_raw = offer.get("departure_time")
+    arr_raw = offer.get("arrival_time")
+    if dep_raw and arr_raw:
+        dep_date = _format_date(dep_raw[:10])
+        dep_time = dep_raw[11:]
+        arr_time = arr_raw[11:]
+        plus = _overnight(dep_raw, arr_raw)
+        outbound = f"Outbound: {dep_date} | {dep_time} → {arr_time}{plus}"
+    else:
+        outbound = None
+
+    # Inbound (return date is known but flight times require a second search)
+    ret_date = route.get("return_date")
+    if ret_date:
+        inbound = f"Inbound: {_format_date(ret_date)} | flight times not available"
+    else:
+        inbound = None
+
+    lines = [header, summary]
+    if outbound or inbound:
+        lines.append("")
+        if outbound:
+            lines.append(outbound)
+        if inbound:
+            lines.append(inbound)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -705,28 +791,18 @@ def main() -> None:
 
         if pct_change is None:
             icon = "🐒"
-            change_line = f"Baseline: {CURRENCY} {price:.2f}"
             log("  First check — baseline recorded.")
         elif pct_change <= -ALERT_THRESHOLD_PCT:
             icon = "✈️"
-            change_line = f"Price *dropped {abs(pct_change):.1f}%*: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
         elif pct_change >= ALERT_THRESHOLD_PCT:
             icon = "⚠️"
-            change_line = f"Price *rose {pct_change:.1f}%*: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
         elif pct_change == 0:
             icon = "➡️"
-            change_line = f"No change: {CURRENCY} {price:.2f}"
         else:
             icon = "🔹"
-            arrow = "▼" if pct_change < 0 else "▲"
-            change_line = f"{arrow} {abs(pct_change):.1f}%: {CURRENCY} {prev:.2f} → {CURRENCY} {price:.2f}"
 
         if NOTIFY_EVERY_RUN or significant:
-            send_telegram(
-                f"{icon} *{label}*\n"
-                f"{change_line}\n"
-                f"{format_offer(offer)}"
-            )
+            send_telegram(format_telegram(route, offer, icon, pct_change))
 
     state["last_run"] = now_str
 
