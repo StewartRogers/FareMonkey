@@ -41,7 +41,7 @@ cp routes.example.json routes.json
 ]
 ```
 
-Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`).
+Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`), `run_hours` (a list of local-time hours, e.g. `[13]`, to check this route on only some of the cron firings instead of every one — see `routes.example.json` for a working example).
 
 ### 3. Install and configure
 
@@ -154,6 +154,19 @@ Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*.
 | `RETENTION_DAYS` | No | `30` | Prune history and archived responses older than this (each run) |
 | `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that connect through a US airport (nonstop and non-US connections kept) |
 
+## SerpAPI account sync & quota alerts
+
+On startup, the monitor calls SerpAPI's free `account.json` endpoint to fetch how many searches remain on your plan, and logs that count after every search (e.g. `[142 left on plan]`) — this call doesn't cost a search itself. If a search fails with HTTP 429 or an error message indicating the plan has run out of searches, a single Telegram alert is sent for that run (further failures in the same run stay silent to avoid spamming one alert per route).
+
+## Running tests
+
+The pure-logic parts of `flight_monitor.py` (no live API calls) are covered by a pytest suite:
+
+```bash
+pip install pytest
+pytest tests/
+```
+
 ## Data archive & retention
 
 Every raw API response is appended to `responses.jsonl` (one JSON object per line) so the full payload — all offers, `price_insights`, airports, booking tokens — is preserved, even though alerts and the dashboard only surface the single cheapest fare. The API key is stripped from the archived query. Set `ARCHIVE_RESPONSES=false` to turn this off.
@@ -194,6 +207,7 @@ The default `MONTHLY_CALL_CAP=240` leaves a comfortable buffer below a 250-searc
 | `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local environment variables |
+| `tests/test_flight_monitor.py` | Pytest suite for pure-logic functions (no live API calls) |
 | `.github/workflows/monitor.yml` | GitHub Actions workflow (manual-only smoke test; commits no data) |
 
 ## License
