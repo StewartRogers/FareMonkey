@@ -707,6 +707,25 @@ class TestSearchCheapest:
             offer = fm.search_cheapest(self.ROUTE)
         assert offer is None
 
+    def test_multi_stop_excluded(self):
+        one_stop = self._flight(5000, layovers=[{"id": "GDL"}])
+        two_stop = self._flight(3000, layovers=[{"id": "GDL"}, {"id": "MEX"}])
+        resp = self._make_response(best=[one_stop, two_stop])
+        with mock.patch("requests.get", return_value=resp), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.ROUTE)
+        assert offer["price"] == 5000.0
+
+    def test_all_multi_stop_returns_none(self):
+        two_stop = self._flight(3000, layovers=[{"id": "GDL"}, {"id": "MEX"}])
+        resp = self._make_response(best=[two_stop])
+        with mock.patch("requests.get", return_value=resp), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.ROUTE)
+        assert offer is None
+
     def test_api_error_returns_none(self):
         resp = mock.Mock()
         resp.status_code = 500
