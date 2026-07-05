@@ -483,6 +483,17 @@ def search_cheapest(route: dict) -> dict | None:
             log("  No itineraries left after excluding US connections.")
             return None
 
+    # SerpAPI's "stops" param only distinguishes nonstop vs. any — cap at one
+    # stop client-side since 2+ stop itineraries are never wanted.
+    kept = [f for f in candidates if len(f.get("layovers", [])) <= 1]
+    dropped = len(candidates) - len(kept)
+    if dropped:
+        log(f"  Excluded {dropped} itinerary(ies) with 2+ stops.")
+    candidates = kept
+    if not candidates:
+        log("  No itineraries left after excluding 2+ stop options.")
+        return None
+
     candidates.sort(key=lambda f: f["price"])
     cheapest = candidates[0]
     offer = {"price": float(cheapest["price"])}
