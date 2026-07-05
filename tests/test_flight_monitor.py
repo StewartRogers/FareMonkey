@@ -145,15 +145,39 @@ class TestCallTracking:
         assert fm.get_call_count(state) == 5
 
     def test_can_make_calls_within_cap(self):
-        state = {"api_calls": {fm.month_key(): 235}}
+        fm._this_month_usage = 235
+        fm._calls_made_this_run = 0
         with mock.patch.object(fm, "MONTHLY_CALL_CAP", 240):
-            assert fm.can_make_calls(state, 5) is True
-            assert fm.can_make_calls(state, 6) is False
+            assert fm.can_make_calls(5) is True
+            assert fm.can_make_calls(6) is False
 
-    def test_can_make_calls_empty_state(self):
+    def test_can_make_calls_counts_calls_made_this_run(self):
+        fm._this_month_usage = 235
+        fm._calls_made_this_run = 3
         with mock.patch.object(fm, "MONTHLY_CALL_CAP", 240):
-            assert fm.can_make_calls({}, 240) is True
-            assert fm.can_make_calls({}, 241) is False
+            assert fm.can_make_calls(2) is True
+            assert fm.can_make_calls(3) is False
+
+    def test_can_make_calls_fails_closed_when_usage_unknown(self):
+        fm._this_month_usage = None
+        fm._calls_made_this_run = 0
+        with mock.patch.object(fm, "MONTHLY_CALL_CAP", 240):
+            assert fm.can_make_calls(1) is False
+
+    def test_current_usage(self):
+        fm._this_month_usage = 40
+        fm._calls_made_this_run = 4
+        assert fm.current_usage() == 44
+
+    def test_current_usage_unknown_when_sync_failed(self):
+        fm._this_month_usage = None
+        assert fm.current_usage() is None
+
+    def test_record_call_increments_this_run_tally(self):
+        fm._calls_made_this_run = 0
+        fm.record_call()
+        fm.record_call()
+        assert fm._calls_made_this_run == 2
 
 
 # ---------------------------------------------------------------------------
@@ -181,13 +205,15 @@ class TestSearchesLeft:
 
     def test_sync_success(self):
         fm._searches_left = None
+        fm._this_month_usage = None
         mock_resp = mock.Mock()
         mock_resp.status_code = 200
-        mock_resp.json.return_value = {"plan_searches_left": 150}
+        mock_resp.json.return_value = {"plan_searches_left": 150, "this_month_usage": 49}
         with mock.patch("requests.get", return_value=mock_resp):
             result = fm.sync_account_quota()
         assert result == 150
         assert fm._searches_left == 150
+        assert fm._this_month_usage == 49
 
     def test_sync_fallback_field(self):
         fm._searches_left = None
@@ -790,6 +816,15 @@ class TestSearchCheapest:
              mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
             fm.search_cheapest(self.ROUTE)
         assert fm._searches_left == 49
+
+    def test_records_real_call_made(self):
+        fm._calls_made_this_run = 0
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(self.ROUTE)
+        assert fm._calls_made_this_run == 1
 
     def test_api_error_json_body(self):
         resp = self._make_response(error="Your plan has run out of searches.")

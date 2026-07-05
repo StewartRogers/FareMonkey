@@ -88,6 +88,14 @@ _QUOTA_ALERTED = False
 # has happened yet (the account call failed or was skipped).
 _searches_left: int | None = None
 
+# Real monthly usage as reported by SerpAPI at process start (None if the sync
+# failed), plus a running tally of searches this process has since made. Used
+# for the monthly-cap check and "Done" log instead of the locally-reported
+# state.json counter, since that counter only sees calls made through this
+# script and can drift from the account's actual usage.
+_this_month_usage: int | None = None
+_calls_made_this_run = 0
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -185,18 +193,42 @@ def increment_call_count(state: dict, n: int = 1) -> None:
     calls[key] = calls.get(key, 0) + n
 
 
-def can_make_calls(state: dict, needed: int) -> bool:
-    return get_call_count(state) + needed <= MONTHLY_CALL_CAP
+def can_make_calls(needed: int) -> bool:
+    """Whether `needed` more searches can be made without exceeding the cap.
+
+    Based on SerpAPI's real ``this_month_usage`` (synced at process start) plus
+    any calls this process has already made, not the locally-reported counter
+    in state.json — that counter only sees calls made through this script and
+    can drift from the account's actual usage. If the sync failed, we can't
+    verify usage, so fail closed rather than risk exceeding the cap.
+    """
+    if _this_month_usage is None:
+        return False
+    return _this_month_usage + _calls_made_this_run + needed <= MONTHLY_CALL_CAP
+
+
+def current_usage() -> int | None:
+    """Real SerpAPI usage this month, or None if the account sync failed."""
+    if _this_month_usage is None:
+        return None
+    return _this_month_usage + _calls_made_this_run
+
+
+def record_call() -> None:
+    """Track a search actually sent to SerpAPI this process, for current_usage()."""
+    global _calls_made_this_run
+    _calls_made_this_run += 1
 
 
 def sync_account_quota() -> int | None:
-    """Fetch remaining searches from the SerpAPI account endpoint.
+    """Fetch remaining searches and this month's real usage from the SerpAPI
+    account endpoint.
 
-    Called once per process (on startup) to seed ``_searches_left``.  Returns
-    the number of plan searches remaining, or None on failure.  This call does
-    **not** consume a search credit.
+    Called once per process (on startup) to seed ``_searches_left`` and
+    ``_this_month_usage``.  Returns the number of plan searches remaining, or
+    None on failure.  This call does **not** consume a search credit.
     """
-    global _searches_left
+    global _searches_left, _this_month_usage
     url = "https://serpapi.com/account.json"
     try:
         resp = requests.get(url, params={"api_key": SERPAPI_API_KEY}, timeout=10)
@@ -204,6 +236,9 @@ def sync_account_quota() -> int | None:
             log(f"  Account sync failed (HTTP {resp.status_code})")
             return None
         data = resp.json()
+        usage = data.get("this_month_usage")
+        if usage is not None:
+            _this_month_usage = int(usage)
         left = data.get("plan_searches_left")
         if left is None:
             left = data.get("searches_left")
@@ -213,7 +248,8 @@ def sync_account_quota() -> int | None:
                 left = total
         if left is not None:
             _searches_left = int(left)
-            log(f"SerpAPI account synced: {_searches_left} searches remaining")
+            usage_str = f", {_this_month_usage} used this month" if _this_month_usage is not None else ""
+            log(f"SerpAPI account synced: {_searches_left} searches remaining{usage_str}")
             return _searches_left
         log(f"  Account sync: could not find searches_left in response")
         return None
@@ -446,6 +482,7 @@ def search_cheapest(route: dict) -> dict | None:
         return None
     # A search credit is consumed once the API returns, regardless of status.
     decrement_searches_left()
+    record_call()
     if resp.status_code != 200:
         log(f"  API error {resp.status_code}: {resp.text[:200]}{log_searches_left()}")
         label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
@@ -671,9 +708,15 @@ def run_scan(days: int) -> None:
     state = load_json(STATE_FILE)
     offsets = list(range(-days, days + 1))
     needed = len(routes) * len(offsets)
-    if not can_make_calls(state, needed):
+    if not can_make_calls(needed):
+        usage = current_usage()
+        if usage is None:
+            sys.exit(
+                "Could not verify real SerpAPI usage (account sync failed). "
+                "Refusing to scan without a reliable usage count."
+            )
         sys.exit(
-            f"Monthly cap would be exceeded ({get_call_count(state)}/{MONTHLY_CALL_CAP}). "
+            f"Monthly cap would be exceeded ({usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used). "
             f"A {len(offsets)}-day scan of {len(routes)} route(s) needs {needed} searches. "
             f"Lower --days or wait for the next month."
         )
@@ -743,7 +786,8 @@ def run_scan(days: int) -> None:
             log("  No offers found in window.\n")
 
     save_json(STATE_FILE, state)
-    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}{log_searches_left()}")
+    usage = current_usage()
+    log(f"Done. API calls this month: {usage if usage is not None else 'unknown'}/{MONTHLY_CALL_CAP}{log_searches_left()}")
 
 
 # ---------------------------------------------------------------------------
@@ -810,9 +854,16 @@ def main() -> None:
 
     # 1 search call per route (SerpAPI uses a single API key, no token call)
     calls_needed = len(routes)
-    if not can_make_calls(state, calls_needed):
+    if not can_make_calls(calls_needed):
+        usage = current_usage()
+        if usage is None:
+            log(
+                "Could not verify real SerpAPI usage (account sync failed). "
+                "Skipping this run rather than risk exceeding the cap."
+            )
+            return
         log(
-            f"Monthly cap would be exceeded ({get_call_count(state)}/{MONTHLY_CALL_CAP}). "
+            f"Monthly cap would be exceeded ({usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used). "
             f"Need {calls_needed} calls. Skipping."
         )
         # Notify once per month so you know checks have paused, without spamming on
@@ -821,7 +872,7 @@ def main() -> None:
             state["cap_alert_month"] = month_key()
             send_telegram(
                 "⛔ *FareMonkey: monthly search cap reached*\n"
-                f"{get_call_count(state)}/{MONTHLY_CALL_CAP} searches used this month "
+                f"{usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used this month "
                 f"({month_key()}). Price checks are paused until next month or until "
                 "you raise `MONTHLY_CALL_CAP`."
             )
@@ -883,7 +934,8 @@ def main() -> None:
             f"Trimmed {hist_removed} history point(s) and {resp_removed} "
             f"archived response(s) older than {RETENTION_DAYS} days."
         )
-    log(f"Done. API calls this month: {get_call_count(state)}/{MONTHLY_CALL_CAP}{log_searches_left()}")
+    usage = current_usage()
+    log(f"Done. API calls this month: {usage if usage is not None else 'unknown'}/{MONTHLY_CALL_CAP}{log_searches_left()}")
 
 
 if __name__ == "__main__":
