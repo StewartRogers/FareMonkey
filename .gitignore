@@ -152,6 +152,7 @@ activemq-data/
 routes.json
 state.json
 responses.jsonl
+flight_monitor.log
 
 # Environments
 .env
