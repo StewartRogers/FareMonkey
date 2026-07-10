@@ -109,6 +109,7 @@ All configuration is read from environment variables (no hardcoded credentials):
 | `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
 | `RETENTION_DAYS` | No | `30` | Prune history points and archived responses older than this (each run) |
 | `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that layover in a US airport (matched against the `US_HUBS` set). Origin/destination are not checked, only connections. |
+| `FLASK_DEBUG` | No | `false` | Enable Flask's debug mode (`app.py` only) — auto-reload and the Werkzeug interactive debugger. Leave off outside local development; the debugger allows arbitrary code execution if the dashboard is ever reachable beyond localhost. |
 
 ## Running locally
 
@@ -159,4 +160,4 @@ Use a WSGI server: `pip install gunicorn && gunicorn app:app -b 0.0.0.0:5000`
 - The `MONTHLY_CALL_CAP` (default 240) leaves a buffer below the user's 250-search/month SerpAPI plan. Each run costs 1 search per route (no separate token call). Do not raise it above the user's plan limit. The local cron runs 3 times a day at 7:30/13:30/19:30 (`30 7,13,19 * * *`) — 6 hours apart and all inside the default active-hours window (`ACTIVE_START=7`, `ACTIVE_END=22`). A plain `0 */6 * * *` schedule would fire at 00:00 and 06:00, which the monitor self-skips as outside active hours, wasting two firings. Do not run the monitor hourly — that would far exceed 250/month.
 - `state.json` and `responses.jsonl` are runtime data, kept **local only** (gitignored). They are never committed or pushed to the repo. The monitor runs locally (e.g. cron on a Raspberry Pi); the GitHub Actions workflow is manual-only (`workflow_dispatch`), has no `schedule`, and commits nothing — so it cannot push data or double-spend the SerpAPI budget against the local cron.
 - Credentials are stored as GitHub repository secrets or in `.env` (gitignored), never in code.
-- The Flask dashboard binds to `127.0.0.1:5000` with `debug=True` in dev mode (`app.py`). For production or LAN access, use gunicorn behind a reverse proxy (gunicorn's `-b 0.0.0.0:5000` exposes it on all interfaces).
+- The Flask dashboard binds to `127.0.0.1:5000` with debug mode off by default; set `FLASK_DEBUG=true` for local development (`app.py`). For production or LAN access, use gunicorn behind a reverse proxy (gunicorn's `-b 0.0.0.0:5000` exposes it on all interfaces) and leave `FLASK_DEBUG` unset — the Werkzeug debugger allows arbitrary code execution if reachable.

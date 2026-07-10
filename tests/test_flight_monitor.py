@@ -90,6 +90,14 @@ class TestLoadRoutes:
             with pytest.raises(SystemExit):
                 fm.load_routes()
 
+    def test_missing_required_field_exits(self, tmp_path):
+        path = tmp_path / "routes.json"
+        routes = [{"origin": "YVR", "departure_date": "2026-12-23"}]
+        path.write_text(json.dumps(routes), encoding="utf-8")
+        with mock.patch.object(fm, "ROUTES_FILE", path):
+            with pytest.raises(SystemExit):
+                fm.load_routes()
+
 
 # ---------------------------------------------------------------------------
 # Helpers: time / scheduling
