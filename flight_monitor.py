@@ -124,6 +124,9 @@ def save_json(path: Path, data: dict) -> None:
         raise
 
 
+REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
+
+
 def load_routes() -> list:
     """Load routes.json (a personal, gitignored config), or exit with guidance."""
     routes = load_json(ROUTES_FILE)
@@ -132,6 +135,13 @@ def load_routes() -> list:
             f"Error: {ROUTES_FILE.name} must contain a non-empty JSON array. "
             f"Copy routes.example.json to {ROUTES_FILE.name} and edit it."
         )
+    for i, route in enumerate(routes):
+        missing = [f for f in REQUIRED_ROUTE_FIELDS if not route.get(f)]
+        if missing:
+            sys.exit(
+                f"Error: {ROUTES_FILE.name} entry {i} is missing required field(s): "
+                f"{', '.join(missing)}"
+            )
     return routes
 
 
@@ -289,16 +299,23 @@ def _has_us_layover(flight: dict) -> bool:
     )
 
 
+def _dedup_airlines(flight: dict) -> list[str]:
+    """Ordered, deduplicated list of airline names across a flight's segments."""
+    airlines: list[str] = []
+    for seg in flight.get("flights", []):
+        airline = seg.get("airline")
+        if airline and airline not in airlines:
+            airlines.append(airline)
+    return airlines
+
+
 def _extract_details(flight: dict) -> dict:
     """Pull human-readable details from a SerpAPI flight option."""
     segments = flight.get("flights", [])
     layovers = flight.get("layovers", [])
-    airlines: list[str] = []
+    airlines = _dedup_airlines(flight)
     flight_numbers: list[str] = []
     for seg in segments:
-        airline = seg.get("airline")
-        if airline and airline not in airlines:
-            airlines.append(airline)
         if seg.get("flight_number"):
             flight_numbers.append(seg["flight_number"])
     dep = segments[0].get("departure_airport", {}) if segments else {}
@@ -316,14 +333,9 @@ def _extract_details(flight: dict) -> dict:
 
 def _summarize(flight: dict) -> dict:
     """Compact summary of one offer, for the alternatives list."""
-    airlines: list[str] = []
-    for seg in flight.get("flights", []):
-        airline = seg.get("airline")
-        if airline and airline not in airlines:
-            airlines.append(airline)
     return {
         "price": float(flight["price"]),
-        "airlines": airlines,
+        "airlines": _dedup_airlines(flight),
         "stops": len(flight.get("layovers", [])),
         "total_duration": flight.get("total_duration"),
     }
@@ -884,44 +896,48 @@ def main() -> None:
 
     for route in routes:
         label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
-        log(f"Checking {label} ...")
+        try:
+            log(f"Checking {label} ...")
 
-        offer = search_cheapest(route)
-        increment_call_count(state, 1)
+            offer = search_cheapest(route)
+            increment_call_count(state, 1)
 
-        if offer is None:
-            log(f"  No offers found for {label}")
+            if offer is None:
+                log(f"  No offers found for {label}")
+                continue
+
+            price = offer["price"]
+            details = {k: v for k, v in offer.items() if k != "price"}
+
+            prev = prices.get(label, {}).get("price")
+            history = prices.get(label, {}).get("history", [])
+            history.append({"price": price, "timestamp": now_str})
+            if len(history) > MAX_HISTORY:
+                history = history[-MAX_HISTORY:]
+            prices[label] = {"price": price, "updated": now_str, "details": details, "history": history}
+            log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else "") + log_searches_left())
+            log(f"  {format_offer(offer)}")
+
+            pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
+            significant = pct_change is not None and abs(pct_change) >= ALERT_THRESHOLD_PCT
+
+            if pct_change is None:
+                icon = "🐒"
+                log("  First check — baseline recorded.")
+            elif pct_change <= -ALERT_THRESHOLD_PCT:
+                icon = "✈️"
+            elif pct_change >= ALERT_THRESHOLD_PCT:
+                icon = "⚠️"
+            elif pct_change == 0:
+                icon = "➡️"
+            else:
+                icon = "🔹"
+
+            if NOTIFY_EVERY_RUN or significant:
+                send_telegram(format_telegram(route, offer, icon, pct_change))
+        except Exception as e:
+            log(f"  Error processing {label}: {e}")
             continue
-
-        price = offer["price"]
-        details = {k: v for k, v in offer.items() if k != "price"}
-
-        prev = prices.get(label, {}).get("price")
-        history = prices.get(label, {}).get("history", [])
-        history.append({"price": price, "timestamp": now_str})
-        if len(history) > MAX_HISTORY:
-            history = history[-MAX_HISTORY:]
-        prices[label] = {"price": price, "updated": now_str, "details": details, "history": history}
-        log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else "") + log_searches_left())
-        log(f"  {format_offer(offer)}")
-
-        pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
-        significant = pct_change is not None and abs(pct_change) >= ALERT_THRESHOLD_PCT
-
-        if pct_change is None:
-            icon = "🐒"
-            log("  First check — baseline recorded.")
-        elif pct_change <= -ALERT_THRESHOLD_PCT:
-            icon = "✈️"
-        elif pct_change >= ALERT_THRESHOLD_PCT:
-            icon = "⚠️"
-        elif pct_change == 0:
-            icon = "➡️"
-        else:
-            icon = "🔹"
-
-        if NOTIFY_EVERY_RUN or significant:
-            send_telegram(format_telegram(route, offer, icon, pct_change))
 
     state["last_run"] = now_str
 

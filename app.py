@@ -22,8 +22,11 @@ CURRENCY = os.environ.get("CURRENCY", "USD")
 
 def load_json(path: Path):
     if path.exists():
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (ValueError, OSError):
+            return {}
     return {}
 
 
@@ -83,4 +86,5 @@ def api_state():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
+    app.run(host="127.0.0.1", port=5000, debug=debug)
