@@ -914,7 +914,13 @@ def main() -> None:
             history.append({"price": price, "timestamp": now_str})
             if len(history) > MAX_HISTORY:
                 history = history[-MAX_HISTORY:]
-            prices[label] = {"price": price, "updated": now_str, "details": details, "history": history}
+            prices[label] = {
+                "price": price,
+                "previous_price": prev,
+                "updated": now_str,
+                "details": details,
+                "history": history,
+            }
             log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else "") + log_searches_left())
             log(f"  {format_offer(offer)}")
 

@@ -47,7 +47,7 @@ FareMonkey/
 - **`templates/dashboard.html`**: Single-page dashboard with dark theme, per-route price charts (Chart.js), percentage-change badges, a price-level verdict and cheapest alternatives per route, flexible-date scan grids, and API usage bar charts.
 - **`routes.json`**: JSON array of route objects — the user's **personal, gitignored** config (copied from `routes.example.json`, the only tracked routes file). Loaded via `load_routes()`, which exits with a "copy routes.example.json" hint if the file is missing or not a non-empty array. Required fields: `origin`, `destination`, `departure_date` (IATA codes, ISO dates). Optional: `return_date` (presence makes it a round trip), `adults` (default 1), `non_stop` (default `true` → nonstop only), `travel_class` (`ECONOMY`/`PREMIUM_ECONOMY`/`BUSINESS`/`FIRST`, default `ECONOMY`), `run_hours` (a list of local-time hours; if set, the route is only checked on cron firings whose hour is in the list, via `route_runs_this_hour()` — lets a route run less often than the rest, e.g. once a day instead of 3 times).
 - **`tests/test_flight_monitor.py`**: Pytest suite covering the pure-logic functions in `flight_monitor.py` (state load/save, trimming, route scheduling, quota tracking, etc.) — no live API calls. Not in `requirements.txt`; install `pytest` separately to run it.
-- **`state.json`**: Persisted state including `prices` (keyed by route label `"ORIGIN-DEST DATE"`, each containing `price`, `updated`, a `details` object with the cheapest offer's airlines/stops/duration plus `alternatives`/`nonstop_price`/`price_level`/`typical_price_range`, and a `history` array), `api_calls` (keyed by `YYYY-MM`), `last_run` timestamp, and `flex_scans` (keyed by `"ORIGIN-DEST"`, each holding the most recent flexible-date scan: `base_date`, `days`, per-date `results`, and the `cheapest` entry). Written atomically via a temp file + `os.replace` so a crash mid-write can't corrupt it.
+- **`state.json`**: Persisted state including `prices` (keyed by route label `"ORIGIN-DEST DATE"`, each containing `price`, `previous_price` (the price it was compared against for that run's alert, `null` on the first check — persisted rather than re-derived from `history` so the dashboard's displayed change always matches what was actually alerted on, even after retention trimming prunes older history points), `updated`, a `details` object with the cheapest offer's airlines/stops/duration plus `alternatives`/`nonstop_price`/`price_level`/`typical_price_range`, and a `history` array), `api_calls` (keyed by `YYYY-MM`), `last_run` timestamp, and `flex_scans` (keyed by `"ORIGIN-DEST"`, each holding the most recent flexible-date scan: `base_date`, `days`, per-date `results`, and the `cheapest` entry). Written atomically via a temp file + `os.replace` so a crash mid-write can't corrupt it.
 
 ## Data model (state.json)
 
@@ -56,6 +56,7 @@ FareMonkey/
   "prices": {
     "JFK-LHR 2026-09-15": {
       "price": 450.00,
+      "previous_price": 480.00,
       "updated": "2026-06-20T10:00:00-04:00",
       "details": {
         "airlines": ["..."], "stops": 0, "total_duration": 420,
