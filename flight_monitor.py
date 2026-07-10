@@ -54,6 +54,9 @@ ROUTES_FILE = Path(__file__).parent / "routes.json"
 # Append-only archive of every raw API response (kept out of state.json so the
 # dashboard, which parses state.json on every request, stays fast).
 RESPONSES_FILE = Path(__file__).parent / "responses.jsonl"
+# Plain-text run log, appended to on every log() call and pruned by RETENTION_DAYS
+# alongside history/responses so it never grows unbounded.
+LOG_FILE = Path(__file__).parent / "flight_monitor.log"
 
 # SerpAPI Google Flights travel_class codes
 TRAVEL_CLASS_MAP = {
@@ -153,16 +156,29 @@ def current_local_time() -> datetime:
     return datetime.now(tz)
 
 
+def _append_log_line(line: str) -> None:
+    """Best-effort append to LOG_FILE — logging must never crash the monitor."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 def log(msg: str = "") -> None:
-    """Print a timestamped log line (in the configured TIMEZONE).
+    """Print a timestamped log line (in the configured TIMEZONE) and append it
+    to LOG_FILE, a project-local file pruned by RETENTION_DAYS (see trim_logs()).
 
     Blank calls stay blank so spacing between sections is preserved.
     """
     if not msg:
         print()
+        _append_log_line("")
         return
     ts = current_local_time().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts}  {msg}")
+    line = f"{ts}  {msg}"
+    print(line)
+    _append_log_line(line)
 
 
 def is_within_active_hours() -> bool:
@@ -418,14 +434,53 @@ def trim_responses(cutoff: datetime) -> int:
     return removed
 
 
-def trim_old_data(state: dict, days: int) -> tuple[int, int]:
-    """Prune history points and archived responses older than `days`.
+def _parse_log_timestamp(line: str) -> datetime | None:
+    """Extract the leading `%Y-%m-%d %H:%M:%S` timestamp from a log line, or
+    None if the line is blank/unparseable (e.g. a spacer line from log())."""
+    try:
+        return datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
 
-    Returns (history_points_removed, responses_removed). Mutates `state` in place
-    (caller is responsible for persisting it).
+
+def trim_logs(cutoff: datetime) -> int:
+    """Drop LOG_FILE lines older than cutoff. Returns the number of lines removed.
+
+    Blank/unparseable lines are always kept (they're spacer lines, not dateable
+    log entries, and dropping them risks nothing but cosmetic spacing).
+    """
+    if not LOG_FILE.exists():
+        return 0
+    cutoff_naive = cutoff.replace(tzinfo=None)
+    kept: list[str] = []
+    removed = 0
+    with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            ts = _parse_log_timestamp(line)
+            if ts is not None and ts < cutoff_naive:
+                removed += 1
+            else:
+                kept.append(line)
+    if removed:
+        fd, tmp = tempfile.mkstemp(dir=LOG_FILE.parent, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(kept)
+            os.replace(tmp, LOG_FILE)
+        except BaseException:
+            os.unlink(tmp)
+            raise
+    return removed
+
+
+def trim_old_data(state: dict, days: int) -> tuple[int, int, int]:
+    """Prune history points, archived responses, and log lines older than `days`.
+
+    Returns (history_points_removed, responses_removed, log_lines_removed).
+    Mutates `state` in place (caller is responsible for persisting it).
     """
     cutoff = current_local_time() - timedelta(days=days)
-    return trim_history(state, cutoff), trim_responses(cutoff)
+    return trim_history(state, cutoff), trim_responses(cutoff), trim_logs(cutoff)
 
 
 def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
@@ -821,13 +876,13 @@ def _days_arg(argv: list[str], default: int) -> int:
 
 
 def run_trim(days: int) -> None:
-    """Manually prune history and the response archive to the last `days` days."""
+    """Manually prune history, the response archive, and log lines to the last `days` days."""
     state = load_json(STATE_FILE)
-    hist_removed, resp_removed = trim_old_data(state, days)
+    hist_removed, resp_removed, log_removed = trim_old_data(state, days)
     save_json(STATE_FILE, state)
     log(
-        f"Trimmed to last {days} days: removed {hist_removed} history point(s) "
-        f"and {resp_removed} archived response(s)."
+        f"Trimmed to last {days} days: removed {hist_removed} history point(s), "
+        f"{resp_removed} archived response(s), and {log_removed} log line(s)."
     )
 
 
@@ -947,14 +1002,14 @@ def main() -> None:
 
     state["last_run"] = now_str
 
-    # Keep the dataset bounded: prune history and archived responses past the
-    # retention window every run so the committed files don't grow forever.
-    hist_removed, resp_removed = trim_old_data(state, RETENTION_DAYS)
+    # Keep the dataset bounded: prune history, archived responses, and log lines
+    # past the retention window every run so local files don't grow forever.
+    hist_removed, resp_removed, log_removed = trim_old_data(state, RETENTION_DAYS)
     save_json(STATE_FILE, state)
-    if hist_removed or resp_removed:
+    if hist_removed or resp_removed or log_removed:
         log(
-            f"Trimmed {hist_removed} history point(s) and {resp_removed} "
-            f"archived response(s) older than {RETENTION_DAYS} days."
+            f"Trimmed {hist_removed} history point(s), {resp_removed} archived "
+            f"response(s), and {log_removed} log line(s) older than {RETENTION_DAYS} days."
         )
     usage = current_usage()
     log(f"Done. API calls this month: {usage if usage is not None else 'unknown'}/{MONTHLY_CALL_CAP}{log_searches_left()}")

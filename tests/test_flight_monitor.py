@@ -38,6 +38,14 @@ def responses_file(tmp_path):
         yield path
 
 
+@pytest.fixture()
+def log_file(tmp_path):
+    """Yield a temporary flight_monitor.log path."""
+    path = tmp_path / "flight_monitor.log"
+    with mock.patch.object(fm, "LOG_FILE", path):
+        yield path
+
+
 # ---------------------------------------------------------------------------
 # Helpers: load / save JSON
 # ---------------------------------------------------------------------------
@@ -629,6 +637,48 @@ class TestTrimResponses:
 
     def test_missing_file(self, responses_file):
         assert fm.trim_responses(datetime(2026, 6, 20)) == 0
+
+
+# ---------------------------------------------------------------------------
+# log() / LOG_FILE
+# ---------------------------------------------------------------------------
+
+class TestLogFile:
+    def test_log_appends_to_file(self, log_file):
+        fm.log("hello")
+        assert "hello" in log_file.read_text(encoding="utf-8")
+
+    def test_log_blank_appends_blank_line(self, log_file):
+        fm.log()
+        assert log_file.read_text(encoding="utf-8") == "\n"
+
+    def test_log_survives_unwritable_file(self, tmp_path):
+        with mock.patch.object(fm, "LOG_FILE", tmp_path / "nope" / "flight_monitor.log"):
+            fm.log("should not raise")  # parent dir doesn't exist
+
+
+class TestTrimLogs:
+    def test_removes_old_lines(self, log_file):
+        log_file.write_text(
+            "2026-06-01 00:00:00  old line\n"
+            "2026-06-25 00:00:00  new line\n",
+            encoding="utf-8",
+        )
+        removed = fm.trim_logs(datetime(2026, 6, 20))
+        assert removed == 1
+        kept = log_file.read_text(encoding="utf-8").strip().split("\n")
+        assert kept == ["2026-06-25 00:00:00  new line"]
+
+    def test_keeps_blank_and_unparseable_lines(self, log_file):
+        log_file.write_text("\nnot a timestamp\n2026-06-01 00:00:00  old\n", encoding="utf-8")
+        removed = fm.trim_logs(datetime(2026, 6, 20))
+        assert removed == 1
+        kept = log_file.read_text(encoding="utf-8")
+        assert "not a timestamp" in kept
+        assert "old" not in kept
+
+    def test_missing_file(self, log_file):
+        assert fm.trim_logs(datetime(2026, 6, 20)) == 0
 
 
 # ---------------------------------------------------------------------------

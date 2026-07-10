@@ -79,7 +79,7 @@ crontab -e
 Add this line (adjust the path):
 
 ```
-30 7,13,19 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py >> /var/log/faremonkey.log 2>&1
+30 7,13,19 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py
 ```
 
 The runs fire at **7:30, 13:30, and 19:30** so they all fall inside the default
@@ -87,6 +87,13 @@ active-hours window (`ACTIVE_START=7`, `ACTIVE_END=22`). A plain `0 */6 * * *`
 schedule would fire at 00:00 and 06:00 too, but the monitor self-skips those
 because they're outside active hours — wasting two of the four daily firings. If
 you widen the active window, adjust these times to match.
+
+No output redirect is needed: every run appends to `flight_monitor.log` in the
+project directory (gitignored, local only), which is pruned by `RETENTION_DAYS`
+on every run just like history and `responses.jsonl` — see "Data archive &
+retention" below. If you still want cron's own mail-on-output behavior
+disabled, redirect stdout/stderr to `/dev/null` instead of a growing file:
+`... flight_monitor.py >/dev/null 2>&1`.
 
 ### 6. Find the cheapest date (flexible-date scan)
 
@@ -172,7 +179,9 @@ pytest tests/
 
 Every raw API response is appended to `responses.jsonl` (one JSON object per line) so the full payload — all offers, `price_insights`, airports, booking tokens — is preserved, even though alerts and the dashboard only surface the single cheapest fare. The API key is stripped from the archived query. Set `ARCHIVE_RESPONSES=false` to turn this off.
 
-To keep these local files from growing forever, each monitor run prunes both the in-state price history and `responses.jsonl` to the last `RETENTION_DAYS` days (default 30). You can also prune on demand without making any API calls:
+Every run also appends its console output to `flight_monitor.log` in the project directory (gitignored, local only) — the same timestamped lines printed to the terminal/cron output, so you have a durable run history without needing to redirect cron's own output anywhere.
+
+To keep these local files from growing forever, each monitor run prunes the in-state price history, `responses.jsonl`, **and** `flight_monitor.log` to the last `RETENTION_DAYS` days (default 30). You can also prune on demand without making any API calls:
 
 ```bash
 python flight_monitor.py --trim            # prune to RETENTION_DAYS
@@ -206,6 +215,7 @@ The default `MONTHLY_CALL_CAP=240` leaves a comfortable buffer below a 250-searc
 | `routes.json` | Routes to track — your personal config (**local only / gitignored**) |
 | `state.json` | Persisted prices, history, and API call counts (auto-generated, **local only / gitignored**) |
 | `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
+| `flight_monitor.log` | Timestamped run log, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local environment variables |
 | `tests/test_flight_monitor.py` | Pytest suite for pure-logic functions (no live API calls) |
