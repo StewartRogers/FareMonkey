@@ -44,7 +44,11 @@ def dashboard():
         timestamps = [h["timestamp"] for h in history]
         price_values = [h["price"] for h in history]
 
-        prev = price_values[-2] if len(price_values) >= 2 else None
+        # Use the exact previous price the monitor compared against when it
+        # last alerted, rather than re-deriving it from history — retention
+        # trimming can prune history independently of what was compared at
+        # alert time, so the two would otherwise drift apart.
+        prev = info.get("previous_price")
         current = info.get("price")
         pct_change = None
         if prev is not None and current is not None and prev > 0:
