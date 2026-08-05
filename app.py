@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """FareMonkey – Flask dashboard for flight price history."""
+from __future__ import annotations
 
 import json
 import os
