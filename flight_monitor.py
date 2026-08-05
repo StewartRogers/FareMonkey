@@ -813,9 +813,17 @@ def run_scan(days: int) -> None:
             if base_ret is not None:
                 probe["return_date"] = (base_ret + timedelta(days=off)).isoformat()
 
-            offer = search_cheapest(probe)
-            increment_call_count(state, 1)
-            price = offer["price"] if offer else None
+            try:
+                offer = search_cheapest(probe)
+                increment_call_count(state, 1)
+                price = offer["price"] if offer else None
+            except Exception as e:
+                increment_call_count(state, 1)
+                log(f"  {dep.isoformat()}: error ({e}){log_searches_left()}")
+                results.append(
+                    {"date": dep.isoformat(), "return_date": probe.get("return_date"), "price": None}
+                )
+                continue
             results.append(
                 {
                     "date": dep.isoformat(),
@@ -837,6 +845,9 @@ def run_scan(days: int) -> None:
             "results": results,
             "cheapest": cheapest,
         }
+        # Save after each route so results already paid for survive a crash
+        # or unhandled error partway through a multi-route scan.
+        save_json(STATE_FILE, state)
 
         if cheapest:
             saving = ""
@@ -976,7 +987,7 @@ def main() -> None:
                 "details": details,
                 "history": history,
             }
-            log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev else "") + log_searches_left())
+            log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev is not None else "") + log_searches_left())
             log(f"  {format_offer(offer)}")
 
             pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None

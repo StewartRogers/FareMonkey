@@ -26,6 +26,7 @@ def load_json(path: Path):
             with open(path) as f:
                 return json.load(f)
         except (ValueError, OSError):
+            app.logger.error("Failed to load %s; dashboard will render as empty", path, exc_info=True)
             return {}
     return {}
 
