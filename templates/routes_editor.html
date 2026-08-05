@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FareMonkey – Routes</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .container { max-width: 900px; margin: 0 auto; padding: 2rem 1rem; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
+    h1 { font-size: 1.8rem; color: #f8fafc; }
+    h1 span { color: #38bdf8; }
+    nav.top-nav { display: flex; gap: 1rem; }
+    nav.top-nav a { color: #38bdf8; text-decoration: none; font-size: 0.85rem; padding: 0.3rem 0.7rem; border: 1px solid #1e3a5f; border-radius: 6px; }
+    nav.top-nav a:hover { background: #1e293b; }
+
+    .route-card { background: #1e293b; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
+    .route-card .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 0.75rem; align-items: start; }
+    .route-card .grid > div { display: flex; flex-direction: column; }
+    label { display: block; font-size: 0.72rem; line-height: 1.3; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 0.25rem; min-height: 2.6em; }
+    input, select { width: 100%; background: #0f172a; border: 1px solid #334155; border-radius: 6px; color: #e2e8f0; padding: 0.45rem 0.5rem; font-size: 0.9rem; }
+    input[type="checkbox"] { width: auto; }
+    .checkbox-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 2.12rem; }
+    .checkbox-row label { margin: 0; }
+    .row-actions { display: flex; justify-content: flex-end; margin-top: 0.75rem; }
+    button { cursor: pointer; border: none; border-radius: 8px; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; }
+    .btn-add { background: #1e3a5f; color: #93c5fd; margin-bottom: 1.5rem; }
+    .btn-remove { background: #7f1d1d; color: #fca5a5; }
+    .btn-save { background: #0369a1; color: #f0f9ff; font-size: 1rem; padding: 0.7rem 1.5rem; }
+    .actions-bar { display: flex; justify-content: space-between; align-items: center; margin-top: 1.5rem; flex-wrap: wrap; gap: 1rem; }
+    .status { font-size: 0.85rem; }
+    .status.error { color: #fca5a5; white-space: pre-line; }
+    .status.ok { color: #34d399; }
+    .hint { font-size: 0.75rem; color: #64748b; margin-top: 0.25rem; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1><span>Fare</span>Monkey <small style="font-size:1rem;color:#94a3b8">/ Routes</small></h1>
+      <nav class="top-nav">
+        <a href="/">Dashboard</a>
+        <a href="/schedule">Schedule</a>
+      </nav>
+    </header>
+
+    <button class="btn-add" id="add-route">+ Add route</button>
+    <div id="routes"></div>
+
+    <div class="actions-bar">
+      <button class="btn-save" id="save">Save routes.json</button>
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+
+  <script>
+    const TRAVEL_CLASSES = {{ travel_classes|tojson }};
+    const routesEl = document.getElementById('routes');
+    const statusEl = document.getElementById('status');
+    let routes = [];
+
+    function card(route, i) {
+      const div = document.createElement('div');
+      div.className = 'route-card';
+      div.innerHTML = `
+        <div class="grid">
+          <div><label>Origin (IATA)</label><input data-f="origin" maxlength="3" value="${route.origin || ''}" placeholder="JFK"></div>
+          <div><label>Destination (IATA)</label><input data-f="destination" maxlength="3" value="${route.destination || ''}" placeholder="LHR"></div>
+          <div><label>Departure date</label><input data-f="departure_date" type="date" value="${route.departure_date || ''}"></div>
+          <div><label>Return date (optional)</label><input data-f="return_date" type="date" value="${route.return_date || ''}"></div>
+          <div><label>Adults</label><input data-f="adults" type="number" min="1" value="${route.adults ?? 1}"></div>
+          <div><label>Travel class</label>
+            <select data-f="travel_class">
+              ${TRAVEL_CLASSES.map(c => `<option value="${c}" ${(route.travel_class || 'ECONOMY') === c ? 'selected' : ''}>${c}</option>`).join('')}
+            </select>
+          </div>
+          <div><label>Run hours (optional)</label><input data-f="run_hours" value="${(route.run_hours || []).join(', ')}" placeholder="e.g. 7, 19">
+            <div class="hint">Comma-separated local-time hours this route checks on. Leave blank to run every firing.</div>
+          </div>
+          <div class="checkbox-row"><input data-f="non_stop" type="checkbox" ${route.non_stop !== false ? 'checked' : ''}><label style="text-transform:none">Nonstop only</label></div>
+        </div>
+        <div class="row-actions"><button class="btn-remove" data-remove="${i}">Remove</button></div>
+      `;
+      return div;
+    }
+
+    function render() {
+      routesEl.innerHTML = '';
+      routes.forEach((r, i) => routesEl.appendChild(card(r, i)));
+      routesEl.querySelectorAll('[data-remove]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          routes.splice(Number(btn.dataset.remove), 1);
+          render();
+        });
+      });
+    }
+
+    function collect() {
+      const cards = routesEl.querySelectorAll('.route-card');
+      return Array.from(cards).map(card => {
+        const get = f => card.querySelector(`[data-f="${f}"]`);
+        const runHoursRaw = get('run_hours').value.trim();
+        const route = {
+          origin: get('origin').value.trim().toUpperCase(),
+          destination: get('destination').value.trim().toUpperCase(),
+          departure_date: get('departure_date').value,
+          adults: Number(get('adults').value) || 1,
+          non_stop: get('non_stop').checked,
+          travel_class: get('travel_class').value,
+        };
+        const returnDate = get('return_date').value;
+        if (returnDate) route.return_date = returnDate;
+        if (runHoursRaw) {
+          route.run_hours = runHoursRaw.split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n));
+        }
+        return route;
+      });
+    }
+
+    document.getElementById('add-route').addEventListener('click', () => {
+      routes.push({ origin: '', destination: '', departure_date: '', adults: 1, non_stop: true, travel_class: 'ECONOMY' });
+      render();
+    });
+
+    document.getElementById('save').addEventListener('click', async () => {
+      routes = collect();
+      statusEl.textContent = 'Saving...';
+      statusEl.className = 'status';
+      try {
+        const resp = await fetch('/api/routes', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(routes),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          statusEl.textContent = (data.errors || ['Save failed']).join('\n');
+          statusEl.className = 'status error';
+          return;
+        }
+        routes = data.routes;
+        render();
+        statusEl.textContent = 'Saved.';
+        statusEl.className = 'status ok';
+      } catch (e) {
+        statusEl.textContent = 'Save failed: ' + e;
+        statusEl.className = 'status error';
+      }
+    });
+
+    (async () => {
+      const resp = await fetch('/api/routes');
+      routes = resp.ok ? await resp.json() : [];
+      render();
+    })();
+  </script>
+</body>
+</html>

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FareMonkey – Schedule</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
+    .container { max-width: 700px; margin: 0 auto; padding: 2rem 1rem; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
+    h1 { font-size: 1.8rem; color: #f8fafc; }
+    h1 span { color: #38bdf8; }
+    nav.top-nav { display: flex; gap: 1rem; }
+    nav.top-nav a { color: #38bdf8; text-decoration: none; font-size: 0.85rem; padding: 0.3rem 0.7rem; border: 1px solid #1e3a5f; border-radius: 6px; }
+    nav.top-nav a:hover { background: #1e293b; }
+
+    .card { background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+    .warn { background: #451a03; color: #fbbf24; border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.85rem; margin-bottom: 1.5rem; }
+    .times { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1rem 0; }
+    .time-chip { display: flex; align-items: center; gap: 0.4rem; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 0.35rem 0.5rem; }
+    .time-chip input { background: transparent; border: none; color: #e2e8f0; font-size: 0.95rem; width: 8rem; }
+    .time-chip button { background: none; border: none; color: #fca5a5; cursor: pointer; font-size: 1rem; line-height: 1; }
+    button { cursor: pointer; border: none; border-radius: 8px; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; }
+    .btn-add { background: #1e3a5f; color: #93c5fd; }
+    .btn-publish { background: #0369a1; color: #f0f9ff; font-size: 1rem; padding: 0.7rem 1.5rem; margin-top: 1rem; }
+    pre { background: #0f172a; border-radius: 8px; padding: 1rem; font-size: 0.8rem; overflow-x: auto; color: #94a3b8; margin-top: 0.75rem; }
+    .status { font-size: 0.85rem; margin-top: 0.75rem; white-space: pre-line; }
+    .status.error { color: #fca5a5; }
+    .status.ok { color: #34d399; }
+    .hint { font-size: 0.8rem; color: #64748b; }
+    label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1><span>Fare</span>Monkey <small style="font-size:1rem;color:#94a3b8">/ Schedule</small></h1>
+      <nav class="top-nav">
+        <a href="/">Dashboard</a>
+        <a href="/routes">Routes</a>
+      </nav>
+    </header>
+
+    {% if not crontab_available %}
+    <div class="warn">No <code>crontab</code> command found on this host — publishing will fail. Install cron, or use this page just to generate the crontab lines and copy them onto the host that runs the monitor.</div>
+    {% endif %}
+
+    <div class="card">
+      <p class="hint">Publishing writes to <strong>this machine's</strong> crontab (whatever host is currently running this Flask app) — not a remote server. Active hours are currently <strong>{{ active_start }}:00–{{ active_end }}:00</strong> (set via <code>ACTIVE_START</code>/<code>ACTIVE_END</code>); the monitor self-skips firings outside that window, so pick times inside it.</p>
+      <div class="times" id="times"></div>
+      <button class="btn-add" id="add-time">+ Add time</button>
+    </div>
+
+    <div class="card">
+      <label>Crontab preview</label>
+      <pre id="preview"></pre>
+      <button class="btn-publish" id="publish">Publish to this host's crontab</button>
+      <div id="status" class="status"></div>
+    </div>
+  </div>
+
+  <script>
+    const timesEl = document.getElementById('times');
+    const previewEl = document.getElementById('preview');
+    const statusEl = document.getElementById('status');
+    let times = [];
+
+    function chip(value, i) {
+      const div = document.createElement('div');
+      div.className = 'time-chip';
+      div.innerHTML = `<input type="time" value="${value}" data-i="${i}"><button data-remove="${i}">×</button>`;
+      return div;
+    }
+
+    function render() {
+      timesEl.innerHTML = '';
+      times.forEach((t, i) => timesEl.appendChild(chip(t, i)));
+      timesEl.querySelectorAll('input').forEach(inp => {
+        inp.addEventListener('change', () => {
+          times[Number(inp.dataset.i)] = inp.value;
+          updatePreview();
+        });
+      });
+      timesEl.querySelectorAll('[data-remove]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          times.splice(Number(btn.dataset.remove), 1);
+          render();
+          updatePreview();
+        });
+      });
+      updatePreview();
+    }
+
+function updatePreview() {
+      previewEl.textContent = times.length
+        ? times.slice().sort().map(t => {
+            const [h, m] = t.split(':');
+            return `${parseInt(m,10)} ${parseInt(h,10)} * * * cd <this project dir> && <python> flight_monitor.py >> /dev/null 2>&1`;
+          }).join('\n')
+        : '(no times set)';
+    }
+
+    document.getElementById('add-time').addEventListener('click', () => {
+      times.push('07:30');
+      render();
+    });
+
+    document.getElementById('publish').addEventListener('click', async () => {
+      statusEl.textContent = 'Publishing...';
+      statusEl.className = 'status';
+      try {
+        const resp = await fetch('/api/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ times }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          statusEl.textContent = (data.errors || ['Publish failed']).join('\n');
+          statusEl.className = 'status error';
+          return;
+        }
+        times = data.times;
+        render();
+        previewEl.textContent = data.preview;
+        statusEl.textContent = 'Published to crontab.';
+        statusEl.className = 'status ok';
+      } catch (e) {
+        statusEl.textContent = 'Publish failed: ' + e;
+        statusEl.className = 'status error';
+      }
+    });
+
+    (async () => {
+      const resp = await fetch('/api/schedule');
+      const data = await resp.json();
+      times = data.times && data.times.length ? data.times : ['07:30', '13:30', '19:30'];
+      render();
+      if (data.preview) previewEl.textContent = data.preview;
+    })();
+  </script>
+</body>
+</html>

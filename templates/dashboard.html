@@ -63,12 +63,19 @@
     .bar-danger { background: #ef4444; }
 
     footer { text-align: center; margin-top: 3rem; font-size: 0.8rem; color: #475569; }
+    nav.top-nav { display: flex; gap: 1rem; }
+    nav.top-nav a { color: #38bdf8; text-decoration: none; font-size: 0.85rem; padding: 0.3rem 0.7rem; border: 1px solid #1e3a5f; border-radius: 6px; }
+    nav.top-nav a:hover { background: #1e293b; }
   </style>
 </head>
 <body>
   <div class="container">
     <header>
       <h1><span>Fare</span>Monkey</h1>
+      <nav class="top-nav">
+        <a href="/routes">Routes</a>
+        <a href="/schedule">Schedule</a>
+      </nav>
       <div class="meta">
         {% if last_run %}Last check: {{ last_run[:19] }}{% else %}No checks yet{% endif %}
       </div>
