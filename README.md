@@ -45,8 +45,32 @@ Fields: `origin` and `destination` are IATA airport codes. `departure_date` is r
 
 ### 3. Install and configure
 
+**Requires Python 3.9–3.13.** Every version in that range is exercised by the
+test matrix in `.github/workflows/tests.yml`, so the same checkout runs unchanged
+on a Raspberry Pi OS bullseye box (3.9) and a current 3.13 system.
+
+Dependencies go in a project-local virtual environment (`.venv`), never in the
+system Python:
+
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+.venv/bin/pip install -U pip -r requirements.txt
+```
+
+On Debian/Raspberry Pi OS this is the only clean option: those systems mark their
+Python "externally managed" ([PEP 668](https://peps.python.org/pep-0668/)) and
+refuse plain `pip install`. The workaround flag `--break-system-packages` installs
+packages that shadow apt-managed ones for *every* Python process you run — a venv
+keeps them scoped to this project instead.
+
+`.venv/` is gitignored. You don't need `source .venv/bin/activate` — running
+`.venv/bin/python` directly is enough, which is what makes the cron line below work.
+
+`setup.sh` does all of this for you (creates the venv, installs dependencies,
+seeds `.env` and `routes.json`) and is safe to re-run:
+
+```bash
+./setup.sh
 ```
 
 ```bash
@@ -58,8 +82,22 @@ Edit `.env` with your credentials.
 ### 4. Run the dashboard
 
 ```bash
-python app.py
+./startweb.sh
 ```
+
+That wrapper launches `app.py` with the venv interpreter (equivalent to
+`.venv/bin/python app.py`) after checking the venv exists, and passes environment
+variables through:
+
+```bash
+PORT=8080 ./startweb.sh
+FLASK_DEBUG=true ./startweb.sh
+```
+
+> **Start the dashboard this way, not with a bare `python app.py`.** The schedule
+> editor writes crontab entries using the interpreter the app is running under
+> (`sys.executable`), so launching it with the system Python would install cron
+> lines pointing at an interpreter that has none of the dependencies.
 
 Open `http://localhost:5000` in your browser. The dashboard shows price charts, percentage changes, and API usage stats. It reads from `state.json` on each page load.
 
@@ -67,7 +105,7 @@ Open `http://localhost:5000` in your browser. The dashboard shows price charts, 
 
 One-off:
 ```bash
-python flight_monitor.py
+.venv/bin/python flight_monitor.py
 ```
 
 Set up a cron job on your Linux server (3 runs/day, 6 hours apart, to stay within the SerpAPI search budget):
@@ -79,8 +117,13 @@ crontab -e
 Add this line (adjust the path):
 
 ```
-30 7,13,19 * * * cd /path/to/FareMonkey && /path/to/python flight_monitor.py
+30 7,13,19 * * * cd /path/to/FareMonkey && /path/to/FareMonkey/.venv/bin/python flight_monitor.py >/dev/null 2>&1
 ```
+
+Point cron at the **venv's** interpreter, not `/usr/bin/python` — cron runs with a
+minimal environment and never sources a shell profile, so an absolute path to
+`.venv/bin/python` is what gives the job its dependencies. No `activate` step is
+needed.
 
 The runs fire at **7:30, 13:30, and 19:30** so they all fall inside the default
 active-hours window (`ACTIVE_START=7`, `ACTIVE_END=22`). A plain `0 */6 * * *`
@@ -101,8 +144,8 @@ The regular monitor checks one fixed date per route. To see whether shifting you
 trip a few days is cheaper, run an on-demand scan:
 
 ```bash
-python flight_monitor.py --scan            # ± 3 days around each route's date (7 searches/route)
-python flight_monitor.py --scan --days 5   # ± 5 days (11 searches/route)
+.venv/bin/python flight_monitor.py --scan            # ± 3 days around each route's date (7 searches/route)
+.venv/bin/python flight_monitor.py --scan --days 5   # ± 5 days (11 searches/route)
 ```
 
 For each route it queries every date in the window, prints a price-per-date table,
@@ -171,9 +214,16 @@ On startup, the monitor calls SerpAPI's free `account.json` endpoint to fetch ho
 The pure-logic parts of `flight_monitor.py` (no live API calls) are covered by a pytest suite:
 
 ```bash
-pip install pytest
-pytest tests/
+.venv/bin/pip install pytest
+.venv/bin/python -m pytest tests/
 ```
+
+The same suite runs in CI on Python 3.9, 3.10, 3.11, 3.12, and 3.13
+(`.github/workflows/tests.yml`) on every push and pull request. It makes no API
+calls and needs no secrets. Note that `requirements.txt` uses open version ranges
+rather than pins on purpose — pip honours each package's `Requires-Python`, so
+Python 3.9 installs the last releases that still support it while 3.13 gets
+current ones. Pinning exact versions would break one end of the range.
 
 ## Data archive & retention
 
@@ -184,8 +234,8 @@ Every run also appends its console output to `flight_monitor.log` in the project
 To keep these local files from growing forever, each monitor run prunes the in-state price history, `responses.jsonl`, **and** `flight_monitor.log` to the last `RETENTION_DAYS` days (default 30). You can also prune on demand without making any API calls:
 
 ```bash
-python flight_monitor.py --trim            # prune to RETENTION_DAYS
-python flight_monitor.py --trim --days 60  # keep the last 60 days
+.venv/bin/python flight_monitor.py --trim            # prune to RETENTION_DAYS
+.venv/bin/python flight_monitor.py --trim --days 60  # keep the last 60 days
 ```
 
 ## Quota math
@@ -217,9 +267,13 @@ The default `MONTHLY_CALL_CAP=240` leaves a comfortable buffer below a 250-searc
 | `responses.jsonl` | Append-only archive of raw API responses, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
 | `flight_monitor.log` | Timestamped run log, pruned to `RETENTION_DAYS` (auto-generated, **local only / gitignored**) |
 | `requirements.txt` | Python dependencies |
+| `setup.sh` | Dependency check + venv creation + local config bootstrap (safe to re-run) |
+| `startweb.sh` | Starts the dashboard using the venv interpreter |
+| `.venv/` | Project virtual environment holding all dependencies (auto-generated, **local only / gitignored**) |
 | `.env.example` | Template for local environment variables |
 | `tests/test_flight_monitor.py` | Pytest suite for pure-logic functions (no live API calls) |
 | `.github/workflows/monitor.yml` | GitHub Actions workflow (manual-only smoke test; commits no data) |
+| `.github/workflows/tests.yml` | GitHub Actions test matrix across Python 3.9–3.13 (no API calls) |
 
 ## License
 

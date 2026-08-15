@@ -1,0 +1,62 @@
+name: Tests
+
+# Verifies the project on every supported Python version (3.9 through 3.13).
+# Pure-logic tests only — no SerpAPI or Telegram calls, so this needs no secrets
+# and costs nothing against the search budget.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+
+    name: Python ${{ matrix.python-version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        # requirements.txt uses open ranges on purpose: pip honours each
+        # package's Requires-Python, so 3.9 resolves to the last versions that
+        # still support it while 3.13 gets current ones.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Show resolved dependency versions
+        run: pip list
+
+      - name: Byte-compile all sources
+        # Catches syntax that a newer/older interpreter rejects before any test
+        # imports run.
+        run: python -m compileall -q flight_monitor.py app.py tests/
+
+      - name: Run test suite
+        run: python -m pytest tests/ -q
+
+      - name: Import the dashboard
+        # app.py is not covered by the test suite; at least prove it imports
+        # cleanly (Flask version compatibility, annotations, etc.).
+        run: python -c "import app; print('app.py OK')"
+
+      - name: Smoke-test the monitor's no-API paths
+        # --trim returns before the API-key check and needs no routes.json, but
+        # exercises state/log handling and the datetime parsing that differs most
+        # across versions — without making a single API call.
+        run: python flight_monitor.py --trim
