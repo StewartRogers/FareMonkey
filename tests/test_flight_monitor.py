@@ -486,7 +486,10 @@ class TestFormatTelegram:
         assert lines[0] == "✈️ YVR → CUN (4 pax)"
 
     def test_price_drop(self):
-        msg = fm.format_telegram(self.ROUTE, self.OFFER, "✈️", -5.2)
+        # Pin CURRENCY: it is read from the environment at import, so a local
+        # .env would otherwise decide whether this assertion holds.
+        with mock.patch.object(fm, "CURRENCY", "CAD"):
+            msg = fm.format_telegram(self.ROUTE, self.OFFER, "✈️", -5.2)
         assert "CAD 4,373 (↓5.2%)" in msg
 
     def test_price_rise(self):
@@ -494,7 +497,8 @@ class TestFormatTelegram:
         assert "(↑3.8%)" in msg
 
     def test_baseline_no_arrow(self):
-        msg = fm.format_telegram(self.ROUTE, self.OFFER, "🐒", None)
+        with mock.patch.object(fm, "CURRENCY", "CAD"):
+            msg = fm.format_telegram(self.ROUTE, self.OFFER, "🐒", None)
         assert "↓" not in msg
         assert "↑" not in msg
         assert "CAD 4,373" in msg
