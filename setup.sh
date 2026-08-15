@@ -18,8 +18,12 @@ missing=0
 if command -v python3 >/dev/null 2>&1; then
     PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
     PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')
-    if [ "$PY_OK" = "1" ]; then
+    # Supported and CI-tested range: 3.9 (Raspberry Pi OS bullseye) through 3.13.
+    PY_NEW=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 14) else 0)')
+    if [ "$PY_OK" = "1" ] && [ "$PY_NEW" = "0" ]; then
         ok "python3 $PY_VER"
+    elif [ "$PY_OK" = "1" ]; then
+        warn "python3 $PY_VER is newer than the tested range (3.9–3.13) — probably fine, but untested"
     else
         fail "python3 found but is $PY_VER (need 3.9+)"
         missing=1
@@ -29,11 +33,15 @@ else
     missing=1
 fi
 
-# --- pip -----------------------------------------------------------------
-if python3 -m pip --version >/dev/null 2>&1; then
-    ok "pip ($(python3 -m pip --version | awk '{print $2}'))"
+# --- venv ------------------------------------------------------------------
+# Dependencies live in a project-local virtual environment (.venv), never in the
+# system Python. Debian/Raspberry Pi OS mark their Python "externally managed"
+# (PEP 668) and refuse plain pip installs; a venv is the supported way around
+# that, and it keeps this project's packages from shadowing apt-managed ones.
+if python3 -m venv --help >/dev/null 2>&1; then
+    ok "venv module available"
 else
-    fail "pip not found for python3"
+    fail "python3 venv module not found"
     missing=1
 fi
 
@@ -63,12 +71,27 @@ if [ "$missing" = "1" ]; then
     exit 1
 fi
 
+# --- Virtual environment ------------------------------------------------------
+echo
+VENV_DIR=".venv"
+VENV_PY="$PWD/$VENV_DIR/bin/python"
+
+if [ -x "$VENV_PY" ]; then
+    ok "virtual environment already exists ($VENV_DIR)"
+else
+    echo "Creating virtual environment in $VENV_DIR ..."
+    python3 -m venv "$VENV_DIR"
+    ok "virtual environment created ($VENV_DIR)"
+fi
+
+"$VENV_PY" -m pip install --quiet --upgrade pip
+
 # --- Python dependencies ----------------------------------------------------
 echo
 echo "Checking Python dependencies from requirements.txt ..."
 
 deps_satisfied() {
-    python3 - <<'EOF'
+    "$VENV_PY" - <<'EOF'
 import importlib.metadata as m
 import re
 import sys
@@ -107,42 +130,26 @@ if deps_satisfied >/tmp/faremonkey_deps_check.$$ 2>&1; then
 else
     cat /tmp/faremonkey_deps_check.$$
     rm -f /tmp/faremonkey_deps_check.$$
-    if python3 -m pip install --user -r requirements.txt 2>/tmp/faremonkey_pip_err.$$; then
-        ok "Python dependencies installed"
-        rm -f /tmp/faremonkey_pip_err.$$
-    elif grep -q "externally-managed-environment" /tmp/faremonkey_pip_err.$$; then
-        rm -f /tmp/faremonkey_pip_err.$$
-        warn "This Python is \"externally managed\" (Debian/Raspberry Pi OS PEP 668) and refuses plain pip installs."
-        echo "  You said no virtual environment, so the remaining option is --break-system-packages,"
-        echo "  which installs into the system Python directly and *can* conflict with apt-managed packages."
-        read -r -p "  Install with --break-system-packages? [y/N] " reply
-        if [[ "$reply" =~ ^[Yy]$ ]]; then
-            python3 -m pip install --user --break-system-packages -r requirements.txt
-            ok "Python dependencies installed (--break-system-packages)"
-        else
-            fail "Dependencies not installed — install manually or re-run and accept --break-system-packages"
-            exit 1
-        fi
+    if "$VENV_PY" -m pip install -r requirements.txt; then
+        ok "Python dependencies installed into $VENV_DIR"
     else
-        cat /tmp/faremonkey_pip_err.$$
-        rm -f /tmp/faremonkey_pip_err.$$
         fail "pip install failed"
         exit 1
     fi
 fi
 
 # --- Optional dev dependency for the test suite -----------------------------
-if ! python3 -m pip show pytest >/dev/null 2>&1; then
+if ! "$VENV_PY" -m pip show pytest >/dev/null 2>&1; then
     echo
     read -r -p "pytest is not installed and is needed to run tests/. Install it now? [y/N] " reply
     if [[ "$reply" =~ ^[Yy]$ ]]; then
-        python3 -m pip install --user pytest
+        "$VENV_PY" -m pip install pytest
         ok "pytest installed"
     else
-        warn "Skipped — run 'pip install pytest' later if you want to run the test suite."
+        warn "Skipped — run '$VENV_DIR/bin/pip install pytest' later if you want to run the test suite."
     fi
 else
-    ok "pytest ($(python3 -m pip show pytest | awk '/^Version:/{print $2}'))"
+    ok "pytest ($("$VENV_PY" -m pip show pytest | awk '/^Version:/{print $2}'))"
 fi
 
 # --- Local config files ------------------------------------------------------
@@ -163,8 +170,13 @@ fi
 
 echo
 echo "Setup complete."
+echo "Everything is installed in $VENV_DIR — always run the project with"
+echo "$VENV_DIR/bin/python (no 'activate' needed, the path is enough)."
+echo
 echo "Next steps:"
 echo "  1. Edit .env with your SERPAPI_API_KEY (and Telegram credentials, optional)."
 echo "  2. Edit routes.json with your routes, or use the dashboard's route editor."
-echo "  3. Run 'python3 flight_monitor.py' to do a manual check."
-echo "  4. Run 'python3 app.py' to start the dashboard at http://localhost:5000"
+echo "  3. Run '$VENV_DIR/bin/python flight_monitor.py' to do a manual check."
+echo "  4. Run '$VENV_DIR/bin/python app.py' to start the dashboard at http://localhost:5000"
+echo "  5. Schedule it with 'crontab -e' using the venv interpreter:"
+echo "     30 7,13,19 * * * cd $PWD && $VENV_PY flight_monitor.py >/dev/null 2>&1"
