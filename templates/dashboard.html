@@ -66,6 +66,10 @@
     nav.top-nav { display: flex; gap: 1rem; }
     nav.top-nav a { color: #38bdf8; text-decoration: none; font-size: 0.85rem; padding: 0.3rem 0.7rem; border: 1px solid #1e3a5f; border-radius: 6px; }
     nav.top-nav a:hover { background: #1e293b; }
+
+    .delete-btn { background: none; border: 1px solid #7f1d1d; color: #fca5a5; border-radius: 6px; font-size: 0.75rem; padding: 0.25rem 0.6rem; cursor: pointer; }
+    .delete-btn:hover { background: #7f1d1d; color: #fecaca; }
+    .delete-btn:disabled { opacity: 0.5; cursor: default; }
   </style>
 </head>
 <body>
@@ -104,7 +108,7 @@
     {% endif %}
 
     {% for route in routes %}
-    <div class="route-card">
+    <div class="route-card" id="route-card-{{ loop.index }}" data-label="{{ route.label }}">
       <div class="route-header">
         <div>
           <div class="route-label">{{ route.label }}</div>
@@ -121,6 +125,9 @@
               <span class="badge badge-neutral">0%</span>
             {% endif %}
           {% endif %}
+          <div style="margin-top:0.5rem;">
+            <button class="delete-btn" onclick='deleteRouteData({{ route.label|tojson }}, "route-card-{{ loop.index }}", this)'>Delete</button>
+          </div>
         </div>
       </div>
       {% if route.current_price is not none %}
@@ -222,6 +229,26 @@
   </div>
 
   <script>
+    function deleteRouteData(label, cardId, btn) {
+      if (!confirm('Delete all price history for "' + label + '"? This cannot be undone.')) return;
+      btn.disabled = true;
+      fetch('/api/routes/' + encodeURIComponent(label), { method: 'DELETE' })
+        .then(res => res.json().then(body => ({ ok: res.ok, body })))
+        .then(({ ok, body }) => {
+          if (!ok) {
+            alert((body.errors && body.errors[0]) || 'Failed to delete');
+            btn.disabled = false;
+            return;
+          }
+          const card = document.getElementById(cardId);
+          if (card) card.remove();
+        })
+        .catch(() => {
+          alert('Failed to delete — check the dashboard server is reachable.');
+          btn.disabled = false;
+        });
+    }
+
     const routeData = {{ routes|tojson }};
     routeData.forEach((route, i) => {
       const ctx = document.getElementById('chart-' + (i + 1));
