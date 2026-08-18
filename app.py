@@ -180,6 +180,25 @@ def api_state():
     return load_json(STATE_FILE)
 
 
+@app.route("/api/routes/<path:label>", methods=["DELETE"])
+def api_route_data_delete(label):
+    """Delete a route's price history/chart data (and any flex scan) from state.json.
+
+    This is the one place app.py writes state.json (see CLAUDE.md) — it's a
+    narrow, user-initiated removal of a single route label, not a
+    read-modify-write of prices the monitor is actively maintaining.
+    """
+    state = load_json(STATE_FILE)
+    prices = state.get("prices", {})
+    flex_scans = state.get("flex_scans", {})
+    if label not in prices and label not in flex_scans:
+        return jsonify({"errors": [f"No data found for '{label}'"]}), 404
+    prices.pop(label, None)
+    flex_scans.pop(label, None)
+    save_json_atomic(STATE_FILE, state)
+    return jsonify({"ok": True})
+
+
 @app.route("/routes")
 def routes_editor():
     return render_template("routes_editor.html", travel_classes=TRAVEL_CLASSES)
