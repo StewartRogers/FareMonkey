@@ -70,6 +70,19 @@
     .delete-btn { background: none; border: 1px solid #7f1d1d; color: #fca5a5; border-radius: 6px; font-size: 0.75rem; padding: 0.25rem 0.6rem; cursor: pointer; }
     .delete-btn:hover { background: #7f1d1d; color: #fecaca; }
     .delete-btn:disabled { opacity: 0.5; cursor: default; }
+
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(2, 6, 23, 0.7); align-items: center; justify-content: center; z-index: 1000; padding: 1rem; }
+    .modal-overlay.open { display: flex; }
+    .modal-box { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.5rem; max-width: 380px; width: 100%; box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4); }
+    .modal-message { color: #e2e8f0; font-size: 0.95rem; line-height: 1.4; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.25rem; }
+    .modal-btn { border-radius: 6px; font-size: 0.85rem; padding: 0.4rem 0.9rem; cursor: pointer; font-weight: 600; }
+    .modal-btn-cancel { background: none; border: 1px solid #334155; color: #cbd5e1; }
+    .modal-btn-cancel:hover { background: #334155; }
+    .modal-btn-confirm { background: #7f1d1d; border: 1px solid #7f1d1d; color: #fecaca; }
+    .modal-btn-confirm:hover { background: #991b1b; }
+    .modal-btn-ok { background: #1e3a5f; border: 1px solid #1e3a5f; color: #93c5fd; }
+    .modal-btn-ok:hover { background: #1e4a7a; }
   </style>
 </head>
 <body>
@@ -228,25 +241,78 @@
     <footer>FareMonkey &middot; Flight price monitor</footer>
   </div>
 
+  <div class="modal-overlay" id="modal-overlay" role="dialog" aria-modal="true" aria-labelledby="modal-message">
+    <div class="modal-box">
+      <div class="modal-message" id="modal-message"></div>
+      <div class="modal-actions">
+        <button class="modal-btn modal-btn-cancel" id="modal-cancel-btn">Cancel</button>
+        <button class="modal-btn" id="modal-confirm-btn">OK</button>
+      </div>
+    </div>
+  </div>
+
   <script>
-    function deleteRouteData(label, cardId, btn) {
-      if (!confirm('Delete all price history for "' + label + '"? This cannot be undone.')) return;
+    function showModal(message, { confirmText, cancelText, danger } = {}) {
+      const overlay = document.getElementById('modal-overlay');
+      const messageEl = document.getElementById('modal-message');
+      const confirmBtn = document.getElementById('modal-confirm-btn');
+      const cancelBtn = document.getElementById('modal-cancel-btn');
+
+      return new Promise(resolve => {
+        messageEl.textContent = message;
+        confirmBtn.textContent = confirmText || 'OK';
+        confirmBtn.className = 'modal-btn ' + (danger ? 'modal-btn-confirm' : 'modal-btn-ok');
+        cancelBtn.style.display = cancelText ? '' : 'none';
+        cancelBtn.textContent = cancelText || 'Cancel';
+
+        function cleanup(result) {
+          overlay.classList.remove('open');
+          confirmBtn.removeEventListener('click', onConfirm);
+          cancelBtn.removeEventListener('click', onCancel);
+          overlay.removeEventListener('mousedown', onOverlayClick);
+          document.removeEventListener('keydown', onKeydown);
+          resolve(result);
+        }
+        function onConfirm() { cleanup(true); }
+        function onCancel() { cleanup(false); }
+        function onOverlayClick(e) { if (e.target === overlay) cleanup(false); }
+        function onKeydown(e) {
+          if (e.key === 'Escape') cleanup(false);
+          else if (e.key === 'Enter') cleanup(true);
+        }
+
+        confirmBtn.addEventListener('click', onConfirm);
+        cancelBtn.addEventListener('click', onCancel);
+        overlay.addEventListener('mousedown', onOverlayClick);
+        document.addEventListener('keydown', onKeydown);
+
+        overlay.classList.add('open');
+        confirmBtn.focus();
+      });
+    }
+
+    async function deleteRouteData(label, cardId, btn) {
+      const confirmed = await showModal(
+        'Delete all price history for "' + label + '"? This cannot be undone.',
+        { confirmText: 'Delete', cancelText: 'Cancel', danger: true }
+      );
+      if (!confirmed) return;
+
       btn.disabled = true;
-      fetch('/api/routes/' + encodeURIComponent(label), { method: 'DELETE' })
-        .then(res => res.json().then(body => ({ ok: res.ok, body })))
-        .then(({ ok, body }) => {
-          if (!ok) {
-            alert((body.errors && body.errors[0]) || 'Failed to delete');
-            btn.disabled = false;
-            return;
-          }
-          const card = document.getElementById(cardId);
-          if (card) card.remove();
-        })
-        .catch(() => {
-          alert('Failed to delete — check the dashboard server is reachable.');
+      try {
+        const res = await fetch('/api/routes/' + encodeURIComponent(label), { method: 'DELETE' });
+        const body = await res.json();
+        if (!res.ok) {
+          await showModal((body.errors && body.errors[0]) || 'Failed to delete', { confirmText: 'OK' });
           btn.disabled = false;
-        });
+          return;
+        }
+        const card = document.getElementById(cardId);
+        if (card) card.remove();
+      } catch (e) {
+        await showModal('Failed to delete — check the dashboard server is reachable.', { confirmText: 'OK' });
+        btn.disabled = false;
+      }
     }
 
     const routeData = {{ routes|tojson }};
