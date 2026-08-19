@@ -7,7 +7,7 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #e2e8f0; }
-    .container { max-width: 700px; margin: 0 auto; padding: 2rem 1rem; }
+    .container { max-width: 780px; margin: 0 auto; padding: 2rem 1rem; }
     header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; flex-wrap: wrap; gap: 1rem; }
     h1 { font-size: 1.8rem; color: #f8fafc; }
     h1 span { color: #38bdf8; }
@@ -16,19 +16,32 @@
     nav.top-nav a:hover { background: #1e293b; }
 
     .card { background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+    .card h2 { font-size: 1rem; color: #f8fafc; margin-bottom: 0.75rem; }
     .warn { background: #451a03; color: #fbbf24; border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.85rem; margin-bottom: 1.5rem; }
-    .times { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 1rem 0; }
-    .time-chip { display: flex; align-items: center; gap: 0.4rem; background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 0.35rem 0.5rem; }
-    .time-chip input { background: transparent; border: none; color: #e2e8f0; font-size: 0.95rem; width: 8rem; }
-    .time-chip button { background: none; border: none; color: #fca5a5; cursor: pointer; font-size: 1rem; line-height: 1; }
+    .warn:empty { display: none; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th { text-align: left; font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; padding-bottom: 0.5rem; font-weight: 600; }
+    td { padding: 0.5rem 0.5rem 0.5rem 0; border-top: 1px solid #334155; vertical-align: top; }
+    td.time { font-variant-numeric: tabular-nums; font-weight: 600; color: #e2e8f0; white-space: nowrap; }
+    td.time.bad { color: #fca5a5; }
+    td.count { text-align: right; color: #94a3b8; white-space: nowrap; }
+    .routes-at { color: #cbd5e1; }
+    .routes-at .every { color: #64748b; }
+    .budget { margin-top: 1rem; font-size: 0.85rem; color: #94a3b8; }
+    .budget strong { color: #e2e8f0; }
+    .budget.over strong { color: #fca5a5; }
+    .sync { font-size: 0.85rem; padding: 0.6rem 0.9rem; border-radius: 8px; margin-bottom: 1rem; }
+    .sync.ok { background: #052e2b; color: #34d399; }
+    .sync.stale { background: #422006; color: #fbbf24; }
     button { cursor: pointer; border: none; border-radius: 8px; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; }
-    .btn-add { background: #1e3a5f; color: #93c5fd; }
     .btn-publish { background: #0369a1; color: #f0f9ff; font-size: 1rem; padding: 0.7rem 1.5rem; margin-top: 1rem; }
+    .btn-publish:disabled { background: #334155; color: #64748b; cursor: not-allowed; }
     pre { background: #0f172a; border-radius: 8px; padding: 1rem; font-size: 0.8rem; overflow-x: auto; color: #94a3b8; margin-top: 0.75rem; }
     .status { font-size: 0.85rem; margin-top: 0.75rem; white-space: pre-line; }
     .status.error { color: #fca5a5; }
     .status.ok { color: #34d399; }
     .hint { font-size: 0.8rem; color: #64748b; }
+    .hint a, .routes-at a { color: #38bdf8; }
     label { font-size: 0.72rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.04em; }
   </style>
 </head>
@@ -47,12 +60,18 @@
     {% endif %}
 
     <div class="card">
-      <p class="hint">Publishing writes to <strong>this machine's</strong> crontab (whatever host is currently running this Flask app) — not a remote server. Active hours are currently <strong>{{ active_start }}:00–{{ active_end }}:00</strong> (set via <code>ACTIVE_START</code>/<code>ACTIVE_END</code>); the monitor self-skips firings outside that window, so pick times inside it.</p>
-      <div class="times" id="times"></div>
-      <button class="btn-add" id="add-time">+ Add time</button>
+      <h2>Firings derived from your routes</h2>
+      <p class="hint">The schedule isn't set here — it's the union of the run times on each <a href="/routes">route</a>. This page shows what that adds up to and installs it into <strong>this machine's</strong> crontab. Active hours are <strong>{{ active_start }}:00–{{ active_end }}:00</strong> (<code>ACTIVE_START</code>/<code>ACTIVE_END</code>); the monitor self-skips anything outside them, so those times are refused rather than published.</p>
+      <div id="conflicts" class="warn" style="margin-top:1rem"></div>
+      <table id="firings">
+        <thead><tr><th>Time</th><th>Routes checked</th><th style="text-align:right">Searches</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div id="budget" class="budget"></div>
     </div>
 
     <div class="card">
+      <div id="sync" class="sync"></div>
       <label>Crontab preview</label>
       <pre id="preview"></pre>
       <button class="btn-publish" id="publish">Publish to this host's crontab</button>
@@ -61,69 +80,75 @@
   </div>
 
   <script>
-    const timesEl = document.getElementById('times');
     const previewEl = document.getElementById('preview');
     const statusEl = document.getElementById('status');
-    let times = [];
+    const syncEl = document.getElementById('sync');
+    const conflictsEl = document.getElementById('conflicts');
+    const budgetEl = document.getElementById('budget');
+    const tbody = document.querySelector('#firings tbody');
+    const publishBtn = document.getElementById('publish');
 
-    function chip(value, i) {
-      const div = document.createElement('div');
-      div.className = 'time-chip';
-      div.innerHTML = `<input type="time" value="${value}" data-i="${i}"><button data-remove="${i}">×</button>`;
-      return div;
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
-    function render() {
-      timesEl.innerHTML = '';
-      times.forEach((t, i) => timesEl.appendChild(chip(t, i)));
-      timesEl.querySelectorAll('input').forEach(inp => {
-        inp.addEventListener('change', () => {
-          times[Number(inp.dataset.i)] = inp.value;
-          updatePreview();
-        });
-      });
-      timesEl.querySelectorAll('[data-remove]').forEach(btn => {
-        btn.addEventListener('click', () => {
-          times.splice(Number(btn.dataset.remove), 1);
-          render();
-          updatePreview();
-        });
-      });
-      updatePreview();
+    function render(plan) {
+      const conflicts = plan.outside_active_hours || [];
+      tbody.innerHTML = (plan.times || []).map(t => {
+        const labels = (plan.by_time && plan.by_time[t]) || [];
+        const bad = conflicts.includes(t);
+        const routes = labels.length
+          ? labels.map(esc).join('<br>')
+          : '<span class="every">no routes</span>';
+        return `<tr>
+          <td class="time ${bad ? 'bad' : ''}">${esc(t)}${bad ? ' ⚠' : ''}</td>
+          <td class="routes-at">${routes}</td>
+          <td class="count">${labels.length}</td>
+        </tr>`;
+      }).join('') || '<tr><td colspan="3" class="routes-at">No run times set on any route.</td></tr>';
+
+      conflictsEl.textContent = conflicts.length
+        ? `${conflicts.join(', ')} fall outside active hours (${plan.active_start}:00–${plan.active_end}:00). `
+          + 'The monitor would skip those firings, so publishing is blocked until you change the route times or widen ACTIVE_START/ACTIVE_END.'
+        : '';
+
+      const over = plan.searches_per_month > plan.monthly_cap;
+      budgetEl.className = 'budget' + (over ? ' over' : '');
+      budgetEl.innerHTML = `<strong>${plan.searches_per_day}</strong> searches/day — about `
+        + `<strong>${plan.searches_per_month}/month</strong> against a cap of ${plan.monthly_cap}.`
+        + (plan.unscheduled && plan.unscheduled.length
+            ? ` ${plan.unscheduled.length} route(s) have no times of their own and run at every firing.`
+            : '')
+        + (plan.legacy && plan.legacy.length
+            ? ` ${plan.legacy.length} route(s) still use the old run_hours field — open the routes page to convert them.`
+            : '');
+
+      if (plan.in_sync) {
+        syncEl.className = 'sync ok';
+        syncEl.textContent = 'The published crontab matches your routes.';
+      } else {
+        syncEl.className = 'sync stale';
+        syncEl.textContent = (plan.published && plan.published.length)
+          ? `Published crontab fires at ${plan.published.join(', ')} — your routes now want ${(plan.times || []).join(', ')}. Publish to update it.`
+          : 'Nothing is published for FareMonkey on this host yet.';
+      }
+
+      previewEl.textContent = plan.preview || '(no times set)';
+      publishBtn.disabled = conflicts.length > 0 || !(plan.times || []).length;
     }
 
-function updatePreview() {
-      previewEl.textContent = times.length
-        ? times.slice().sort().map(t => {
-            const [h, m] = t.split(':');
-            return `${parseInt(m,10)} ${parseInt(h,10)} * * * cd <this project dir> && <python> flight_monitor.py >> /dev/null 2>&1`;
-          }).join('\n')
-        : '(no times set)';
-    }
-
-    document.getElementById('add-time').addEventListener('click', () => {
-      times.push('07:30');
-      render();
-    });
-
-    document.getElementById('publish').addEventListener('click', async () => {
+    publishBtn.addEventListener('click', async () => {
       statusEl.textContent = 'Publishing...';
       statusEl.className = 'status';
       try {
-        const resp = await fetch('/api/schedule', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ times }),
-        });
+        const resp = await fetch('/api/schedule', { method: 'POST' });
         const data = await resp.json();
         if (!resp.ok) {
           statusEl.textContent = (data.errors || ['Publish failed']).join('\n');
           statusEl.className = 'status error';
           return;
         }
-        times = data.times;
-        render();
-        previewEl.textContent = data.preview;
+        render(data);
         statusEl.textContent = 'Published to crontab.';
         statusEl.className = 'status ok';
       } catch (e) {
@@ -134,10 +159,7 @@ function updatePreview() {
 
     (async () => {
       const resp = await fetch('/api/schedule');
-      const data = await resp.json();
-      times = data.times && data.times.length ? data.times : ['07:30', '13:30', '19:30'];
-      render();
-      if (data.preview) previewEl.textContent = data.preview;
+      render(await resp.json());
     })();
   </script>
 </body>

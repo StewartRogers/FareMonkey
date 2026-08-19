@@ -134,15 +134,54 @@ class TestActiveHours:
             assert fm.is_within_active_hours() is False
 
 
-class TestRouteRunsThisHour:
-    def test_no_run_hours_always_runs(self):
-        assert fm.route_runs_this_hour({"origin": "A"}, 7) is True
+class TestParseRunTime:
+    @pytest.mark.parametrize("value,expected", [
+        ("00:00", 0), ("7:30", 450), ("07:30", 450), ("23:59", 1439), (" 13:05 ", 785),
+    ])
+    def test_valid(self, value, expected):
+        assert fm.parse_run_time(value) == expected
 
-    def test_run_hours_matching(self):
-        assert fm.route_runs_this_hour({"run_hours": [7, 13, 19]}, 13) is True
+    @pytest.mark.parametrize("value", ["24:00", "7:60", "7-30", "0730", "", None, 730, "7:30:00"])
+    def test_invalid(self, value):
+        assert fm.parse_run_time(value) is None
 
-    def test_run_hours_not_matching(self):
-        assert fm.route_runs_this_hour({"run_hours": [13]}, 7) is False
+
+class TestRouteRunsAt:
+    def at(self, hour, minute):
+        return datetime(2026, 6, 28, hour, minute)
+
+    def test_no_schedule_runs_on_every_firing(self):
+        assert fm.route_runs_at({"origin": "A"}, self.at(7, 30)) is True
+
+    def test_run_times_matching(self):
+        route = {"run_times": ["07:30", "19:30"]}
+        assert fm.route_runs_at(route, self.at(19, 30)) is True
+
+    def test_run_times_not_matching(self):
+        assert fm.route_runs_at({"run_times": ["13:30"]}, self.at(7, 30)) is False
+
+    def test_late_start_within_tolerance_still_counts(self):
+        # Interpreter startup and the account-quota sync happen before routes are
+        # filtered, so the firing must not have to land on the exact minute.
+        with mock.patch.object(fm, "RUN_TIME_TOLERANCE_MIN", 10):
+            assert fm.route_runs_at({"run_times": ["07:30"]}, self.at(7, 36)) is True
+            assert fm.route_runs_at({"run_times": ["07:30"]}, self.at(7, 45)) is False
+
+    def test_tolerance_wraps_around_midnight(self):
+        with mock.patch.object(fm, "RUN_TIME_TOLERANCE_MIN", 10):
+            assert fm.route_runs_at({"run_times": ["00:00"]}, self.at(23, 55)) is True
+
+    def test_malformed_run_time_is_ignored_not_fatal(self):
+        assert fm.route_runs_at({"run_times": ["7-30"]}, self.at(7, 30)) is False
+
+    def test_legacy_run_hours_still_honoured(self):
+        assert fm.route_runs_at({"run_hours": [7, 13, 19]}, self.at(13, 5)) is True
+        assert fm.route_runs_at({"run_hours": [13]}, self.at(7, 30)) is False
+
+    def test_run_times_takes_precedence_over_run_hours(self):
+        route = {"run_times": ["19:30"], "run_hours": [7]}
+        assert fm.route_runs_at(route, self.at(7, 30)) is False
+        assert fm.route_runs_at(route, self.at(19, 30)) is True
 
 
 # ---------------------------------------------------------------------------

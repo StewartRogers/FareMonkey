@@ -6,7 +6,11 @@
     "return_date": "2026-09-22",
     "adults": 1,
     "non_stop": true,
-    "travel_class": "ECONOMY"
+    "travel_class": "ECONOMY",
+    "run_times": [
+      "07:30",
+      "19:30"
+    ]
   },
   {
     "origin": "SFO",
@@ -15,6 +19,8 @@
     "adults": 2,
     "non_stop": false,
     "travel_class": "PREMIUM_ECONOMY",
-    "run_hours": [13]
+    "run_times": [
+      "13:30"
+    ]
   }
 ]

@@ -31,6 +31,11 @@ TRAVEL_CLASSES = ("ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST")
 REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
 IATA_RE = re.compile(r"^[A-Z]{3}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+# Used only when no route declares a run_time and the host has no FareMonkey
+# crontab block yet — the schedule documented in README/CLAUDE.md.
+DEFAULT_TIMES = ("07:30", "13:30", "19:30")
 
 # Cron lines this app manages are wrapped in these markers so publishing a new
 # schedule only touches FareMonkey's own block, leaving any other crontab
@@ -92,6 +97,14 @@ def validate_routes(routes) -> list[str]:
         travel_class = route.get("travel_class")
         if travel_class and travel_class not in TRAVEL_CLASSES:
             errors.append(f"Route {i + 1}: travel_class must be one of {', '.join(TRAVEL_CLASSES)}")
+        run_times = route.get("run_times")
+        if run_times not in (None, "", []):
+            if not isinstance(run_times, list) or not all(
+                isinstance(t, str) and TIME_RE.match(t.strip()) for t in run_times
+            ):
+                errors.append(
+                    f"Route {i + 1}: run_times must be a list of 24h \"HH:MM\" times"
+                )
         run_hours = route.get("run_hours")
         if run_hours not in (None, ""):
             if not isinstance(run_hours, list) or not all(
@@ -99,6 +112,25 @@ def validate_routes(routes) -> list[str]:
             ):
                 errors.append(f"Route {i + 1}: run_hours must be a list of hours (0-23)")
     return errors
+
+
+def active_window() -> tuple[int, int]:
+    try:
+        start = int(os.environ.get("ACTIVE_START", "7"))
+        end = int(os.environ.get("ACTIVE_END", "22"))
+    except ValueError:
+        return 7, 22
+    return start, end
+
+
+def outside_active_hours(times) -> list[str]:
+    """Return the times the monitor would self-skip as outside its active window.
+
+    A firing outside ACTIVE_START..ACTIVE_END installs fine in cron and then does
+    nothing, which is the silent failure this check exists to surface.
+    """
+    start, end = active_window()
+    return [t for t in times if not (start <= int(t.split(":")[0]) < end)]
 
 
 def normalize_route(route: dict) -> dict:
@@ -116,9 +148,18 @@ def normalize_route(route: dict) -> dict:
         out["non_stop"] = bool(route["non_stop"])
     if route.get("travel_class"):
         out["travel_class"] = route["travel_class"]
-    if route.get("run_hours"):
+    if route.get("run_times"):
+        out["run_times"] = sorted({normalize_time(t) for t in route["run_times"]})
+    elif route.get("run_hours"):
+        # Legacy filter-only field: kept as-is so a hand-edited routes.json keeps
+        # working. flight_monitor.route_runs_at() still honours it.
         out["run_hours"] = sorted(set(route["run_hours"]))
     return out
+
+
+def normalize_time(value: str) -> str:
+    hour, minute = value.strip().split(":")
+    return f"{int(hour):02d}:{int(minute):02d}"
 
 
 @app.route("/")
@@ -224,18 +265,147 @@ def api_routes_save():
 
     normalized = [normalize_route(r) for r in payload]
     save_json_atomic(ROUTES_FILE, normalized)
-    return jsonify({"ok": True, "routes": normalized})
+
+    # Saving a route changes the schedule the crontab is derived from, so hand
+    # back the recomputed plan (and anything the monitor would silently skip)
+    # instead of making the user go and re-read the schedule page to find out.
+    plan = schedule_plan(normalized)
+    published = current_schedule()
+    warnings = []
+    if plan["outside_active_hours"]:
+        warnings.append(
+            "These run times are outside active hours "
+            f"({plan['active_start']}:00–{plan['active_end']}:00) and would be skipped: "
+            + ", ".join(plan["outside_active_hours"])
+        )
+    if plan["searches_per_month"] > plan["monthly_cap"]:
+        warnings.append(
+            f"This schedule needs about {plan['searches_per_month']} searches/month, "
+            f"over the {plan['monthly_cap']} cap."
+        )
+    if published != plan["times"]:
+        warnings.append("The published crontab no longer matches these routes — publish it on the Schedule page.")
+    return jsonify({
+        "ok": True,
+        "routes": normalized,
+        "schedule": schedule_response(plan, published),
+        "warnings": warnings,
+    })
 
 
 # ---------------------------------------------------------------------------
-# Cron schedule editor
+# Cron schedule
 #
-# Publishes to *this host's* crontab — the Flask app may itself be running on
-# the machine that runs the scheduled monitor, so "publish" always means "the
-# crontab of whatever machine app.py is currently running on."
+# Routes are the single source of truth for *when* the monitor runs: each route
+# carries its own run_times, and the crontab block is the union of them. The
+# schedule page is a derived view of that union plus the Publish button — it has
+# no times of its own to get out of step with routes.json.
+#
+# Publishing writes to *this host's* crontab — the Flask app may itself be
+# running on the machine that runs the scheduled monitor, so "publish" always
+# means "the crontab of whatever machine app.py is currently running on."
 # ---------------------------------------------------------------------------
 
-TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+
+def route_label(route: dict) -> str:
+    """Same label flight_monitor.py uses for state.json keys."""
+    return f"{route.get('origin', '?')}-{route.get('destination', '?')} {route.get('departure_date', '?')}"
+
+
+def route_times(route: dict) -> list[str]:
+    """The clock times a route declares, normalized. Empty means 'every firing'."""
+    times = route.get("run_times")
+    if isinstance(times, list):
+        return sorted({
+            normalize_time(t) for t in times
+            if isinstance(t, str) and TIME_RE.match(t.strip())
+        })
+    # A legacy run_hours route declares no times: that field can only filter
+    # firings, never create one, so it contributes nothing to the union.
+    return []
+
+
+def hours_as_times(hours, published) -> list[str]:
+    """Turn legacy run_hours into concrete times.
+
+    An hour that matches a published firing keeps that firing's minutes (so 7 on a
+    7:30 crontab stays 07:30 rather than becoming a second, useless 07:00 line);
+    anything else lands on the hour.
+    """
+    times = []
+    for h in hours:
+        match = next((t for t in published if int(t.split(":")[0]) == h), None)
+        times.append(match or f"{int(h):02d}:00")
+    return sorted(set(times))
+
+
+def schedule_plan(routes=None) -> dict:
+    """Derive the whole schedule from routes.json.
+
+    Returns the union of run_times (the crontab to publish), which routes fire at
+    each time, the routes with no schedule of their own (they run at *every*
+    time), the resulting search budget, and any times the monitor would skip as
+    outside active hours.
+    """
+    if routes is None:
+        routes = load_json(ROUTES_FILE)
+    if not isinstance(routes, list):
+        routes = []
+
+    published = current_schedule()
+
+    scheduled, unscheduled, legacy = {}, [], []
+    for route in routes:
+        if not isinstance(route, dict):
+            continue
+        label = route_label(route)
+        times = route_times(route)
+        if times:
+            scheduled[label] = times
+        elif isinstance(route.get("run_hours"), list):
+            hours = sorted(set(route["run_hours"]))
+            legacy.append({"label": label, "run_hours": hours, "as_times": hours_as_times(hours, published)})
+        else:
+            unscheduled.append(label)
+
+    union = sorted(
+        {t for times in scheduled.values() for t in times}
+        # A not-yet-migrated run_hours route declares no times, so leaving it out
+        # of the union would publish a crontab that drops the firings it currently
+        # relies on. Map its hours onto real times instead, so publishing before
+        # migrating preserves the schedule rather than silently killing the route.
+        | {t for entry in legacy for t in entry["as_times"]}
+    )
+    if not union:
+        # Nothing declares a time yet: keep whatever is already published, or fall
+        # back to the documented default so the page has something to show.
+        union = published or list(DEFAULT_TIMES)
+
+    by_time = {}
+    for t in union:
+        at_this_time = [label for label, times in scheduled.items() if t in times]
+        # A route with no run_times of its own runs on every firing, and a legacy
+        # run_hours route runs on the firings whose hour it lists.
+        at_this_time += unscheduled
+        at_this_time += [
+            entry["label"] for entry in legacy if int(t.split(":")[0]) in entry["run_hours"]
+        ]
+        by_time[t] = sorted(at_this_time)
+
+    searches_per_day = sum(len(labels) for labels in by_time.values())
+    start, end = active_window()
+    return {
+        "times": union,
+        "by_time": by_time,
+        "unscheduled": sorted(unscheduled),
+        "legacy": legacy,
+        "searches_per_day": searches_per_day,
+        "searches_per_month": searches_per_day * 30,
+        "monthly_cap": int(os.environ.get("MONTHLY_CALL_CAP", "240")),
+        "outside_active_hours": outside_active_hours(union),
+        "active_start": start,
+        "active_end": end,
+    }
 
 
 def read_crontab() -> str:
@@ -310,29 +480,48 @@ def _which(cmd: str) -> str | None:
     return None
 
 
+def schedule_response(plan: dict, published: list[str]) -> dict:
+    out = dict(plan)
+    out["published"] = published
+    out["in_sync"] = published == plan["times"]
+    out["preview"] = build_cron_block(plan["times"])
+    return out
+
+
 @app.route("/api/schedule", methods=["GET"])
 def api_schedule_get():
-    return jsonify({"times": current_schedule(), "preview": build_cron_block(current_schedule() or ["07:30", "13:30", "19:30"])})
+    return jsonify(schedule_response(schedule_plan(), current_schedule()))
 
 
 @app.route("/api/schedule", methods=["POST"])
 def api_schedule_publish():
-    payload = request.get_json(silent=True) or {}
-    times = payload.get("times")
-    if not isinstance(times, list) or not times:
-        return jsonify({"errors": ["times must be a non-empty array of \"HH:MM\" strings"]}), 400
-    bad = [t for t in times if not isinstance(t, str) or not TIME_RE.match(t)]
-    if bad:
-        return jsonify({"errors": [f"Invalid time(s): {', '.join(bad)} — use 24h HH:MM"]}), 400
+    """Install the schedule derived from routes.json.
 
-    normalized = sorted({f"{int(h):02d}:{int(m):02d}" for h, m in (t.split(":") for t in times)})
+    There is deliberately nothing to pass in: the times come from the routes, so
+    the only thing this endpoint decides is whether the derived schedule is safe
+    to install.
+    """
+    plan = schedule_plan()
+    if not plan["times"]:
+        return jsonify({"errors": ["No run times to publish — give at least one route a run time."]}), 400
+    if plan["outside_active_hours"]:
+        return jsonify({"errors": [
+            "Refusing to publish: "
+            + ", ".join(plan["outside_active_hours"])
+            + f" fall outside active hours ({plan['active_start']}:00–{plan['active_end']}:00), so the "
+            "monitor would skip those firings. Change the route times, or widen "
+            "ACTIVE_START/ACTIVE_END."
+        ]}), 400
+
     try:
-        publish_schedule(normalized)
+        publish_schedule(plan["times"])
     except (OSError, RuntimeError) as e:
         app.logger.error("Failed to publish crontab", exc_info=True)
         return jsonify({"errors": [f"Could not install crontab: {e}"]}), 500
 
-    return jsonify({"ok": True, "times": normalized, "preview": build_cron_block(normalized)})
+    response = schedule_response(plan, plan["times"])
+    response["ok"] = True
+    return jsonify(response)
 
 
 def _port_available(host: str, port: int) -> bool:
