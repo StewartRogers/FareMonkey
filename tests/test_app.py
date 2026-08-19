@@ -23,6 +23,16 @@ import app as webapp
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def no_live_crontab(monkeypatch):
+    """Every schedule-aware endpoint reads the crontab, including POST /api/routes.
+
+    Default all of them to "no crontab installed"; tests that care about the
+    published schedule override read_crontab themselves.
+    """
+    monkeypatch.setattr(webapp, "read_crontab", lambda: "")
+
+
 @pytest.fixture()
 def client():
     webapp.app.testing = True
@@ -108,6 +118,18 @@ class TestValidateRoutes:
         }])
         assert any("travel_class must be one of" in e for e in errors)
 
+    def test_valid_run_times(self):
+        routes = [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+                   "run_times": ["7:30", "19:30"]}]
+        assert webapp.validate_routes(routes) == []
+
+    @pytest.mark.parametrize("value", [["25:00"], ["7:60"], ["0730"], [730], "07:30"])
+    def test_bad_run_times(self, value):
+        routes = [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+                   "run_times": value}]
+        errors = webapp.validate_routes(routes)
+        assert any("run_times must be a list" in e for e in errors)
+
     def test_bad_run_hours(self):
         errors = webapp.validate_routes([{
             "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
@@ -139,6 +161,21 @@ class TestNormalizeRoute:
             "return_date": "2027-03-27",
         })
         assert out["return_date"] == "2027-03-27"
+
+    def test_run_times_padded_sorted_and_deduped(self):
+        out = webapp.normalize_route({
+            "origin": "yvr", "destination": "fra", "departure_date": "2027-03-15",
+            "run_times": ["19:30", "7:30", "07:30"],
+        })
+        assert out["run_times"] == ["07:30", "19:30"]
+
+    def test_run_times_supersede_legacy_run_hours(self):
+        out = webapp.normalize_route({
+            "origin": "yvr", "destination": "fra", "departure_date": "2027-03-15",
+            "run_times": ["19:30"], "run_hours": [7],
+        })
+        assert out["run_times"] == ["19:30"]
+        assert "run_hours" not in out
 
     def test_run_hours_sorted_and_deduped(self):
         out = webapp.normalize_route({
@@ -352,24 +389,147 @@ class TestCurrentSchedule:
         assert webapp.current_schedule() == ["07:30", "19:30"]
 
 
+class TestOutsideActiveHours:
+    def test_flags_only_times_outside_the_window(self, monkeypatch):
+        monkeypatch.setenv("ACTIVE_START", "7")
+        monkeypatch.setenv("ACTIVE_END", "22")
+        assert webapp.outside_active_hours(["06:59", "07:00", "21:59", "22:00"]) == ["06:59", "22:00"]
+
+    def test_falls_back_to_defaults_on_junk_env(self, monkeypatch):
+        monkeypatch.setenv("ACTIVE_START", "not-a-number")
+        assert webapp.outside_active_hours(["05:00", "13:30"]) == ["05:00"]
+
+
+class TestSchedulePlan:
+    def test_union_of_route_run_times(self, routes_file):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30", "19:30"]},
+            {"origin": "SFO", "destination": "NRT", "departure_date": "2027-04-01",
+             "run_times": ["13:30"]},
+        ]))
+        plan = webapp.schedule_plan()
+        assert plan["times"] == ["07:30", "13:30", "19:30"]
+        assert plan["by_time"]["13:30"] == ["SFO-NRT 2027-04-01"]
+        assert plan["by_time"]["07:30"] == ["YVR-FRA 2027-03-15"]
+        assert plan["searches_per_day"] == 3
+        assert plan["searches_per_month"] == 90
+
+    def test_route_without_times_runs_at_every_firing(self, routes_file):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30", "19:30"]},
+            {"origin": "SFO", "destination": "NRT", "departure_date": "2027-04-01"},
+        ]))
+        plan = webapp.schedule_plan()
+        assert plan["times"] == ["07:30", "19:30"]
+        assert plan["unscheduled"] == ["SFO-NRT 2027-04-01"]
+        assert all("SFO-NRT 2027-04-01" in labels for labels in plan["by_time"].values())
+        assert plan["searches_per_day"] == 4
+
+    def test_legacy_run_hours_keeps_its_published_firing(self, routes_file, monkeypatch):
+        # Publishing before migrating must not drop the firings a run_hours route
+        # relies on: hour 13 maps onto the published 13:30, not a new 13:00 line.
+        monkeypatch.setattr(webapp, "current_schedule", lambda: ["07:30", "13:30"])
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30"]},
+            {"origin": "SFO", "destination": "NRT", "departure_date": "2027-04-01",
+             "run_hours": [13]},
+        ]))
+        plan = webapp.schedule_plan()
+        assert plan["times"] == ["07:30", "13:30"]
+        assert plan["by_time"]["07:30"] == ["YVR-FRA 2027-03-15"]
+        assert plan["by_time"]["13:30"] == ["SFO-NRT 2027-04-01"]
+        assert plan["legacy"] == [
+            {"label": "SFO-NRT 2027-04-01", "run_hours": [13], "as_times": ["13:30"]}
+        ]
+
+    def test_legacy_run_hours_falls_back_to_the_whole_hour(self, routes_file):
+        routes_file.write_text(json.dumps([
+            {"origin": "SFO", "destination": "NRT", "departure_date": "2027-04-01",
+             "run_hours": [13]},
+        ]))
+        plan = webapp.schedule_plan()  # nothing published, so no minutes to inherit
+        assert plan["times"] == ["13:00"]
+        assert plan["by_time"]["13:00"] == ["SFO-NRT 2027-04-01"]
+
+    def test_falls_back_to_published_schedule_when_no_route_has_times(self, routes_file, monkeypatch):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15"},
+        ]))
+        monkeypatch.setattr(webapp, "current_schedule", lambda: ["09:00"])
+        assert webapp.schedule_plan()["times"] == ["09:00"]
+
+    def test_falls_back_to_defaults_when_nothing_published(self, routes_file):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15"},
+        ]))
+        assert webapp.schedule_plan()["times"] == list(webapp.DEFAULT_TIMES)
+
+    def test_flags_times_outside_active_hours(self, routes_file, monkeypatch):
+        monkeypatch.setenv("ACTIVE_START", "7")
+        monkeypatch.setenv("ACTIVE_END", "22")
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["05:00", "13:30", "23:00"]},
+        ]))
+        assert webapp.schedule_plan()["outside_active_hours"] == ["05:00", "23:00"]
+
+
 class TestApiSchedule:
-    def test_get_reflects_current_schedule(self, client, monkeypatch):
-        monkeypatch.setattr(webapp, "read_crontab", lambda: "")
-        resp = client.get("/api/schedule")
-        body = resp.get_json()
-        assert body["times"] == []
+    def test_get_derives_times_from_routes(self, client, routes_file):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30"]},
+        ]))
+        body = client.get("/api/schedule").get_json()
+        assert body["times"] == ["07:30"]
+        assert body["published"] == []
+        assert body["in_sync"] is False
         assert webapp.CRON_BEGIN in body["preview"]
 
-    def test_post_rejects_empty_times(self, client):
-        resp = client.post("/api/schedule", json={"times": []})
-        assert resp.status_code == 400
+    def test_get_reports_in_sync_when_crontab_matches(self, client, routes_file, monkeypatch):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30"]},
+        ]))
+        monkeypatch.setattr(webapp, "read_crontab", lambda: (
+            webapp.CRON_BEGIN + "\n30 7 * * * cd /x && python /x/flight_monitor.py\n" + webapp.CRON_END + "\n"
+        ))
+        body = client.get("/api/schedule").get_json()
+        assert body["in_sync"] is True
 
-    def test_post_rejects_malformed_time(self, client):
-        resp = client.post("/api/schedule", json={"times": ["25:00"]})
+    def test_post_refuses_times_outside_active_hours(self, client, routes_file, monkeypatch):
+        monkeypatch.setenv("ACTIVE_START", "7")
+        monkeypatch.setenv("ACTIVE_END", "22")
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["05:00"]},
+        ]))
+        resp = client.post("/api/schedule")
         assert resp.status_code == 400
-        assert "25:00" in resp.get_json()["errors"][0]
+        assert "05:00" in resp.get_json()["errors"][0]
 
-    def test_post_publishes_via_crontab_command(self, client, monkeypatch):
+    def test_post_publishes_the_derived_schedule(self, client, routes_file, monkeypatch):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30", "19:30"]},
+        ]))
+        installed = []
+        monkeypatch.setattr(
+            webapp, "publish_schedule", lambda times: installed.append(list(times))
+        )
+        body = client.post("/api/schedule").get_json()
+        assert installed == [["07:30", "19:30"]]
+        assert body["ok"] is True
+        assert body["in_sync"] is True
+
+    def test_post_publishes_via_crontab_command(self, client, routes_file, monkeypatch):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30", "13:30", "19:30"]},
+        ]))
         calls = []
 
         def fake_run(args, input=None, capture_output=None, text=None):
@@ -379,7 +539,7 @@ class TestApiSchedule:
             return mock.Mock(returncode=0, stderr="")
 
         monkeypatch.setattr(webapp.subprocess, "run", fake_run)
-        resp = client.post("/api/schedule", json={"times": ["07:30", "13:30", "19:30"]})
+        resp = client.post("/api/schedule")
         assert resp.status_code == 200
         assert resp.get_json()["times"] == ["07:30", "13:30", "19:30"]
 
@@ -387,14 +547,19 @@ class TestApiSchedule:
         assert webapp.CRON_BEGIN in install_call[1]
         assert "30 7 * * *" in install_call[1]
 
-    def test_post_returns_500_on_crontab_failure(self, client, monkeypatch):
+    def test_post_returns_500_on_crontab_failure(self, client, routes_file, monkeypatch):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30"]},
+        ]))
+
         def fake_run(args, input=None, capture_output=None, text=None):
             if args == ["crontab", "-l"]:
                 return mock.Mock(returncode=0, stdout="")
             return mock.Mock(returncode=1, stderr="permission denied")
 
         monkeypatch.setattr(webapp.subprocess, "run", fake_run)
-        resp = client.post("/api/schedule", json={"times": ["07:30"]})
+        resp = client.post("/api/schedule")
         assert resp.status_code == 500
         assert "permission denied" in resp.get_json()["errors"][0]
 
@@ -409,6 +574,7 @@ class TestApiSchedule:
             return mock.Mock(returncode=0, stderr="")
 
         monkeypatch.setattr(webapp.subprocess, "run", fake_run)
+        monkeypatch.setattr(webapp, "read_crontab", lambda: existing)  # opt out of the autouse stub
         webapp.publish_schedule(["07:30"])
         install_call = next(c for c in calls if c[0] == ["crontab", "-"])
         assert "some-other-job" in install_call[1]
@@ -428,6 +594,7 @@ class TestApiSchedule:
             return mock.Mock(returncode=0, stderr="")
 
         monkeypatch.setattr(webapp.subprocess, "run", fake_run)
+        monkeypatch.setattr(webapp, "read_crontab", lambda: existing)  # opt out of the autouse stub
         webapp.publish_schedule(["13:30"])
         install_call = next(c for c in calls if c[0] == ["crontab", "-"])
         assert "old-line" not in install_call[1]

@@ -39,6 +39,11 @@ CURRENCY = os.environ.get("CURRENCY", "USD")
 TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 ACTIVE_START = int(os.environ.get("ACTIVE_START", "7"))
 ACTIVE_END = int(os.environ.get("ACTIVE_END", "22"))
+# How far from a route's scheduled run_time the process may start and still count
+# as that firing. Cron fires on the minute, but interpreter startup and the
+# account-quota sync happen before routes are filtered, so an exact match would
+# be brittle.
+RUN_TIME_TOLERANCE_MIN = int(os.environ.get("RUN_TIME_TOLERANCE_MIN", "10"))
 ALERT_THRESHOLD_PCT = float(os.environ.get("ALERT_THRESHOLD_PCT", "3"))
 NOTIFY_EVERY_RUN = os.environ.get("NOTIFY_EVERY_RUN", "true").lower() in ("1", "true", "yes", "on")
 MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "240"))
@@ -186,18 +191,60 @@ def is_within_active_hours() -> bool:
     return ACTIVE_START <= now.hour < ACTIVE_END
 
 
-def route_runs_this_hour(route: dict, hour: int) -> bool:
-    """Decide whether a route should be checked on the current cron firing.
+def parse_run_time(value) -> int | None:
+    """Convert an ``"HH:MM"`` run time to minutes since local midnight.
 
-    A route may set an optional ``run_hours`` list (local-time hours) to limit
-    which firings it runs on — e.g. ``"run_hours": [13]`` checks once a day on the
-    13:xx firing. Without ``run_hours`` the route runs on every firing (the
-    default). The values must match the hours the cron actually fires at.
+    Returns ``None`` for anything that isn't a well-formed 24-hour time, so a
+    typo in routes.json degrades to "this entry doesn't match" rather than
+    crashing the monitor mid-run.
     """
+    if not isinstance(value, str):
+        return None
+    parts = value.strip().split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        hour, minute = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour * 60 + minute
+
+
+def _minutes_apart(a: int, b: int) -> int:
+    """Distance in minutes between two times of day, wrapping around midnight."""
+    diff = abs(a - b)
+    return min(diff, 1440 - diff)
+
+
+def route_runs_at(route: dict, now: datetime) -> bool:
+    """Decide whether a route should be checked on the firing happening now.
+
+    Routes own their schedule: ``"run_times": ["07:30", "19:30"]`` is the list of
+    local clock times this route is checked at, and the crontab the dashboard
+    publishes is the union of every route's run_times (see app.py). A route is
+    considered due when the process starts within RUN_TIME_TOLERANCE_MIN of one
+    of its times.
+
+    Two fallbacks keep older routes.json files working:
+
+    * ``run_hours`` (a list of local-time hours) — the previous filter-only
+      field, honoured when ``run_times`` is absent.
+    * neither field — the route runs on *every* firing, which is what a route
+      with no schedule of its own has always meant.
+    """
+    run_times = route.get("run_times")
+    if run_times:
+        now_minutes = now.hour * 60 + now.minute
+        return any(
+            scheduled is not None and _minutes_apart(now_minutes, scheduled) <= RUN_TIME_TOLERANCE_MIN
+            for scheduled in (parse_run_time(t) for t in run_times)
+        )
     run_hours = route.get("run_hours")
     if run_hours is None:
         return True
-    return hour in run_hours
+    return now.hour in run_hours
 
 
 def month_key() -> str:
@@ -905,6 +952,10 @@ def main() -> None:
     if argv and argv[0] == "--trim":
         run_trim(_days_arg(argv, RETENTION_DAYS))
         return
+    # Routes are normally filtered down to the ones due at this clock time, which
+    # would make an ad-hoc `python flight_monitor.py` at 09:04 a no-op. --force
+    # checks every route right now, active hours included.
+    force = "--force" in argv
 
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
@@ -912,20 +963,26 @@ def main() -> None:
     sync_account_quota()
 
     if not is_within_active_hours():
-        log(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
-        return
+        if not force:
+            log(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}). Skipping.")
+            return
+        log(f"Outside active hours ({ACTIVE_START}:00–{ACTIVE_END}:00 {TIMEZONE}), but --force was given.")
 
     all_routes = load_routes()
 
-    # Some routes opt into a reduced schedule via "run_hours"; skip the ones that
-    # aren't scheduled for this firing so they don't spend a search.
-    this_hour = current_local_time().hour
-    routes = [r for r in all_routes if route_runs_this_hour(r, this_hour)]
+    # Each route carries its own run_times; the crontab is their union, so a given
+    # firing only checks the routes due at that time. Skipping the rest here is
+    # what keeps a reduced-schedule route from spending a search.
+    now = current_local_time()
+    routes = all_routes if force else [r for r in all_routes if route_runs_at(r, now)]
     skipped = len(all_routes) - len(routes)
     if skipped:
-        log(f"Skipping {skipped} route(s) not scheduled for the {this_hour}:00 firing.")
+        log(f"Skipping {skipped} route(s) not scheduled for the {now.strftime('%H:%M')} firing.")
     if not routes:
-        log("No routes scheduled for this firing. Nothing to do.")
+        log(
+            f"No routes scheduled for {now.strftime('%H:%M')}. Nothing to do "
+            "(run with --force to check every route now)."
+        )
         return
 
     state = load_json(STATE_FILE)

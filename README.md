@@ -41,7 +41,9 @@ cp routes.example.json routes.json
 ]
 ```
 
-Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`), `run_hours` (a list of local-time hours, e.g. `[13]`, to check this route on only some of the cron firings instead of every one — see `routes.example.json` for a working example).
+Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`), `run_times` (the local clock times this route is checked at, e.g. `["07:30", "19:30"]` — see `routes.example.json` for a working example).
+
+**Routes decide when the monitor runs.** The crontab is the union of every route's `run_times`, so adding a time to a route adds a firing and removing the last route that used a time removes it. A route with no `run_times` is checked at *every* firing the other routes schedule. The dashboard's Schedule page shows that union — which routes fire at each time and what it costs in searches — and installs it (see "Schedule" below). The older `run_hours` field (a list of hours that could only *filter* firings the crontab already had, never create one) still works: the Schedule page maps those hours onto real times — reusing the published firing's minutes where there is one — so publishing before you migrate keeps the route running, and the routes editor converts the field to `run_times` when you save.
 
 ### 3. Install and configure
 
@@ -95,7 +97,7 @@ FLASK_DEBUG=true ./startweb.sh
 ```
 
 > **Start the dashboard this way, not with a bare `python app.py`.** The schedule
-> editor writes crontab entries using the interpreter the app is running under
+> page writes crontab entries using the interpreter the app is running under
 > (`sys.executable`), so launching it with the system Python would install cron
 > lines pointing at an interpreter that has none of the dependencies.
 
@@ -105,16 +107,30 @@ Open `http://localhost:5000` in your browser. The dashboard shows price charts, 
 
 One-off:
 ```bash
-.venv/bin/python flight_monitor.py
+.venv/bin/python flight_monitor.py --force   # check every route right now
+.venv/bin/python flight_monitor.py           # check only the routes due at this minute
 ```
 
-Set up a cron job on your Linux server (3 runs/day, 6 hours apart, to stay within the SerpAPI search budget):
+Without `--force` the monitor checks the routes whose `run_times` match the
+current clock time (within `RUN_TIME_TOLERANCE_MIN`, default 10), which is what
+makes one crontab line serve routes on different schedules. An ad-hoc run at an
+unscheduled minute would therefore do nothing — `--force` checks every route
+regardless of its times or the active-hours window.
+
+### Installing the schedule
+
+The crontab is derived from your routes, so the easiest path is the dashboard's
+**Schedule** page: it shows the union of every route's `run_times`, which routes
+fire at each one, the resulting monthly search count, and a Publish button that
+installs exactly that into the crontab of the host running the dashboard. It
+refuses to publish a time outside the active-hours window, since the monitor
+would silently skip it.
+
+To do the same by hand, one line per distinct run time (adjust the path):
 
 ```bash
 crontab -e
 ```
-
-Add this line (adjust the path):
 
 ```
 30 7,13,19 * * * cd /path/to/FareMonkey && /path/to/FareMonkey/.venv/bin/python flight_monitor.py >/dev/null 2>&1
@@ -130,6 +146,12 @@ active-hours window (`ACTIVE_START=7`, `ACTIVE_END=22`). A plain `0 */6 * * *`
 schedule would fire at 00:00 and 06:00 too, but the monitor self-skips those
 because they're outside active hours — wasting two of the four daily firings. If
 you widen the active window, adjust these times to match.
+
+Each firing only checks the routes due at that time, so a crontab line is
+harmless for routes that don't want it — but a `run_times` entry with no matching
+crontab line never runs. Publishing from the Schedule page keeps the two in step;
+if you edit the crontab by hand, make sure every distinct `run_times` value has a
+line.
 
 No output redirect is needed: every run appends to `flight_monitor.log` in the
 project directory (gitignored, local only), which is pruned by `RETENTION_DAYS`
@@ -196,6 +218,7 @@ Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*.
 | `TIMEZONE` | No | `America/New_York` | IANA timezone for active-hours check |
 | `ACTIVE_START` | No | `7` | Start of active window (hour) |
 | `ACTIVE_END` | No | `22` | End of active window (hour) |
+| `RUN_TIME_TOLERANCE_MIN` | No | `10` | How far from a route's `run_times` the process may start and still count as that firing |
 | `ALERT_THRESHOLD_PCT` | No | `3` | Min % change to trigger alert |
 | `NOTIFY_EVERY_RUN` | No | `true` | Send Telegram message on every run, not just significant changes |
 | `MONTHLY_CALL_CAP` | No | `240` | Max SerpAPI searches per calendar month |
