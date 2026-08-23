@@ -39,6 +39,13 @@
     .time-chip input { border: none; background: transparent; width: 6.5rem; padding: 0.2rem; }
     .time-chip button { background: none; border: none; color: #fca5a5; padding: 0 0.2rem; font-size: 1rem; line-height: 1; }
     .btn-time { background: #1e3a5f; color: #93c5fd; padding: 0.35rem 0.7rem; font-size: 0.8rem; }
+    .add-buttons { display: flex; gap: 0.75rem; margin-bottom: 1.5rem; }
+    .legs-list { display: flex; flex-direction: column; gap: 0.4rem; margin-bottom: 0.5rem; }
+    .leg-row { display: grid; grid-template-columns: 4.5rem 1.2rem 4.5rem 1fr 1.6rem; gap: 0.4rem; align-items: center; }
+    .leg-row input { width: auto; }
+    .leg-arrow { color: #64748b; text-align: center; }
+    .leg-remove { background: none; border: none; color: #fca5a5; font-size: 1.1rem; line-height: 1; padding: 0.2rem; }
+    button:disabled { opacity: 0.35; cursor: not-allowed; }
     .warnings { background: #451a03; color: #fbbf24; border-radius: 8px; padding: 0.75rem 1rem; font-size: 0.85rem; margin-top: 1rem; white-space: pre-line; }
     .warnings:empty { display: none; }
     .plan { font-size: 0.8rem; color: #94a3b8; margin-top: 1rem; }
@@ -55,7 +62,10 @@
       </nav>
     </header>
 
-    <button class="btn-add" id="add-route">+ Add route</button>
+    <div class="add-buttons">
+      <button class="btn-add" id="add-route">+ Add route</button>
+      <button class="btn-add" id="add-legs-route">+ Add multi-leg route</button>
+    </div>
     <div id="routes"></div>
 
     <div class="actions-bar">
@@ -93,29 +103,66 @@
             ? `Converted from run_hours [${route.run_hours.join(', ')}] — saving stores these times.`
             : 'The crontab is the union of every route\'s run times.')
         : 'No times of its own — this route is checked on every firing other routes schedule.';
+      const timesBlock = `
+        <div class="times-cell">
+          <label>Run times</label>
+          <div class="times" data-f="run_times">
+            ${runTimes.map(t => `<span class="time-chip"><input type="time" value="${t}"><button type="button" data-remove-time>×</button></span>`).join('')}
+            <button type="button" class="btn-time" data-add-time="${i}">+ Add time</button>
+          </div>
+          <div class="hint">${hint}</div>
+        </div>
+      `;
+      const sharedFields = `
+        <div><label>Adults</label><input data-f="adults" type="number" min="1" value="${route.adults ?? 1}"></div>
+        <div><label>Teens (12-17)</label><input data-f="teens" type="number" min="0" value="${route.teens ?? 0}"></div>
+        <div><label>Travel class</label>
+          <select data-f="travel_class">
+            ${TRAVEL_CLASSES.map(c => `<option value="${c}" ${(route.travel_class || 'ECONOMY') === c ? 'selected' : ''}>${c}</option>`).join('')}
+          </select>
+        </div>
+        <div><label>Max duration, hours (optional)</label><input data-f="max_duration_hours" type="number" min="0" step="0.5" value="${route.max_duration_hours ?? ''}" placeholder="e.g. 24"></div>
+        <div class="checkbox-row"><input data-f="non_stop" type="checkbox" ${route.non_stop !== false ? 'checked' : ''}><label style="text-transform:none">Nonstop only</label></div>
+        ${timesBlock}
+      `;
+
       const div = document.createElement('div');
       div.className = 'route-card';
+
+      if (Array.isArray(route.legs)) {
+        const legs = route.legs;
+        div.innerHTML = `
+          <div class="grid">
+            <div class="times-cell">
+              <label>Legs (origin → destination, one date each)</label>
+              <div class="legs-list" data-f="legs">
+                ${legs.map(leg => `
+                  <div class="leg-row">
+                    <input data-lf="origin" maxlength="3" value="${leg.origin || ''}" placeholder="JFK">
+                    <span class="leg-arrow">→</span>
+                    <input data-lf="destination" maxlength="3" value="${leg.destination || ''}" placeholder="HEL">
+                    <input data-lf="date" type="date" value="${leg.date || ''}">
+                    <button type="button" class="leg-remove" data-remove-leg ${legs.length <= 2 ? 'disabled' : ''}>×</button>
+                  </div>
+                `).join('')}
+              </div>
+              <button type="button" class="btn-time" data-add-leg="${i}">+ Add leg</button>
+              <div class="hint">At least 2 legs. The route label uses the first leg's origin, each leg's destination in order, and the first leg's date.</div>
+            </div>
+            ${sharedFields}
+          </div>
+          <div class="row-actions"><button class="btn-remove" data-remove="${i}">Remove route</button></div>
+        `;
+        return div;
+      }
+
       div.innerHTML = `
         <div class="grid">
           <div><label>Origin (IATA)</label><input data-f="origin" maxlength="3" value="${route.origin || ''}" placeholder="JFK"></div>
           <div><label>Destination (IATA)</label><input data-f="destination" maxlength="3" value="${route.destination || ''}" placeholder="LHR"></div>
           <div><label>Departure date</label><input data-f="departure_date" type="date" value="${route.departure_date || ''}"></div>
           <div><label>Return date (optional)</label><input data-f="return_date" type="date" value="${route.return_date || ''}"></div>
-          <div><label>Adults</label><input data-f="adults" type="number" min="1" value="${route.adults ?? 1}"></div>
-          <div><label>Travel class</label>
-            <select data-f="travel_class">
-              ${TRAVEL_CLASSES.map(c => `<option value="${c}" ${(route.travel_class || 'ECONOMY') === c ? 'selected' : ''}>${c}</option>`).join('')}
-            </select>
-          </div>
-          <div class="checkbox-row"><input data-f="non_stop" type="checkbox" ${route.non_stop !== false ? 'checked' : ''}><label style="text-transform:none">Nonstop only</label></div>
-          <div class="times-cell">
-            <label>Run times</label>
-            <div class="times" data-f="run_times">
-              ${runTimes.map(t => `<span class="time-chip"><input type="time" value="${t}"><button type="button" data-remove-time>×</button></span>`).join('')}
-              <button type="button" class="btn-time" data-add-time="${i}">+ Add time</button>
-            </div>
-            <div class="hint">${hint}</div>
-          </div>
+          ${sharedFields}
         </div>
         <div class="row-actions"><button class="btn-remove" data-remove="${i}">Remove</button></div>
       `;
@@ -150,6 +197,22 @@
           render();
         });
       });
+      routesEl.querySelectorAll('[data-add-leg]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const i = Number(btn.dataset.addLeg);
+          routes = collect();
+          routes[i].legs = (routes[i].legs || []).concat({ origin: '', destination: '', date: '' });
+          render();
+        });
+      });
+      routesEl.querySelectorAll('[data-remove-leg]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (btn.disabled) return;
+          btn.closest('.leg-row').remove();
+          routes = collect();
+          render();
+        });
+      });
       renderPlan();
     }
 
@@ -170,16 +233,40 @@
         const runTimes = Array.from(get('run_times').querySelectorAll('input[type="time"]'))
           .map(inp => inp.value)
           .filter(Boolean);
+
+        const maxDurationHours = get('max_duration_hours').value;
+
+        const legsContainer = get('legs');
+        if (legsContainer) {
+          const legs = Array.from(legsContainer.querySelectorAll('.leg-row')).map(row => ({
+            origin: row.querySelector('[data-lf="origin"]').value.trim().toUpperCase(),
+            destination: row.querySelector('[data-lf="destination"]').value.trim().toUpperCase(),
+            date: row.querySelector('[data-lf="date"]').value,
+          }));
+          const route = {
+            legs,
+            adults: Number(get('adults').value) || 1,
+            teens: Number(get('teens').value) || 0,
+            non_stop: get('non_stop').checked,
+            travel_class: get('travel_class').value,
+          };
+          if (maxDurationHours) route.max_duration_hours = Number(maxDurationHours);
+          if (runTimes.length) route.run_times = [...new Set(runTimes)].sort();
+          return route;
+        }
+
         const route = {
           origin: get('origin').value.trim().toUpperCase(),
           destination: get('destination').value.trim().toUpperCase(),
           departure_date: get('departure_date').value,
           adults: Number(get('adults').value) || 1,
+          teens: Number(get('teens').value) || 0,
           non_stop: get('non_stop').checked,
           travel_class: get('travel_class').value,
         };
         const returnDate = get('return_date').value;
         if (returnDate) route.return_date = returnDate;
+        if (maxDurationHours) route.max_duration_hours = Number(maxDurationHours);
         if (runTimes.length) route.run_times = [...new Set(runTimes)].sort();
         return route;
       });
@@ -187,6 +274,17 @@
 
     document.getElementById('add-route').addEventListener('click', () => {
       routes.push({ origin: '', destination: '', departure_date: '', adults: 1, non_stop: true, travel_class: 'ECONOMY' });
+      render();
+    });
+
+    document.getElementById('add-legs-route').addEventListener('click', () => {
+      routes.push({
+        legs: [
+          { origin: '', destination: '', date: '' },
+          { origin: '', destination: '', date: '' },
+        ],
+        adults: 1, non_stop: true, travel_class: 'ECONOMY',
+      });
       render();
     });
 

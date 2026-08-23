@@ -50,6 +50,10 @@ MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "240"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "1000"))
 # When true, drop any itinerary that connects through a US airport (see US_HUBS).
 EXCLUDE_US_CONNECTIONS = os.environ.get("EXCLUDE_US_CONNECTIONS", "false").lower() in ("1", "true", "yes", "on")
+# When true, ask SerpAPI for a deep_search on multi-leg (legs) routes only. SerpAPI's
+# docs flag multi-city as a case where results may not match the Google Flights
+# website without it, at extra cost and slower response time. Off by default.
+MULTI_CITY_DEEP_SEARCH = os.environ.get("MULTI_CITY_DEEP_SEARCH", "false").lower() in ("1", "true", "yes", "on")
 ARCHIVE_RESPONSES = os.environ.get("ARCHIVE_RESPONSES", "true").lower() in ("1", "true", "yes", "on")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 
@@ -133,6 +137,33 @@ def save_json(path: Path, data: dict) -> None:
 
 
 REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
+REQUIRED_LEG_FIELDS = ("origin", "destination", "date")
+
+
+def _is_legs_route(route) -> bool:
+    """True if `route` is a multi-leg (multi-city) route, i.e. carries a "legs"
+    array instead of the simple origin/destination/departure_date fields."""
+    return isinstance(route, dict) and "legs" in route
+
+
+def route_label(route: dict) -> str:
+    """Build the state.json / archive label for a route.
+
+    Simple route: "ORIGIN-DEST DATE". Multi-leg route: the airport chain
+    joined by "-" (first leg's origin, then every leg's destination in
+    order) plus the first leg's date, e.g. "JFK-HEL-BER-JFK 2026-09-15" for
+    JFK-HEL, HEL-BER, BER-JFK. Never raises — a malformed route degrades to
+    "?" placeholders rather than crashing the monitor mid-run.
+    """
+    if _is_legs_route(route):
+        legs = route.get("legs") or []
+        if not legs:
+            return "? ?"
+        chain = [str((legs[0] or {}).get("origin", "?"))] + [
+            str((leg or {}).get("destination", "?")) for leg in legs
+        ]
+        return f"{'-'.join(chain)} {(legs[0] or {}).get('date', '?')}"
+    return f"{route.get('origin', '?')}-{route.get('destination', '?')} {route.get('departure_date', '?')}"
 
 
 def load_routes() -> list:
@@ -144,6 +175,29 @@ def load_routes() -> list:
             f"Copy routes.example.json to {ROUTES_FILE.name} and edit it."
         )
     for i, route in enumerate(routes):
+        if _is_legs_route(route):
+            conflicting = [f for f in REQUIRED_ROUTE_FIELDS + ("return_date",) if route.get(f)]
+            if conflicting:
+                sys.exit(
+                    f"Error: {ROUTES_FILE.name} entry {i}: 'legs' cannot be combined with "
+                    f"{', '.join(conflicting)}."
+                )
+            legs = route.get("legs")
+            if not isinstance(legs, list) or len(legs) < 2:
+                sys.exit(
+                    f"Error: {ROUTES_FILE.name} entry {i}: 'legs' must be a list of at "
+                    "least 2 {origin, destination, date} objects."
+                )
+            for j, leg in enumerate(legs):
+                missing = [
+                    f for f in REQUIRED_LEG_FIELDS if not (isinstance(leg, dict) and leg.get(f))
+                ]
+                if missing:
+                    sys.exit(
+                        f"Error: {ROUTES_FILE.name} entry {i} leg {j}: missing required "
+                        f"field(s): {', '.join(missing)}"
+                    )
+            continue
         missing = [f for f in REQUIRED_ROUTE_FIELDS if not route.get(f)]
         if missing:
             sys.exit(
@@ -416,7 +470,7 @@ def archive_response(route: dict, params: dict, data: dict) -> None:
         return
     record = {
         "timestamp": current_local_time().isoformat(),
-        "route": f"{route['origin']}-{route['destination']}",
+        "route": route_label(route),
         "query": {k: v for k, v in params.items() if k != "api_key"},
         "response": data,
     }
@@ -566,26 +620,52 @@ def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
 
 def search_cheapest(route: dict) -> dict | None:
     """Return the cheapest option (price + details) for a route, or None on failure."""
+    is_legs = _is_legs_route(route)
     travel_class = TRAVEL_CLASS_MAP.get(
         str(route.get("travel_class", "ECONOMY")).upper(), 1
     )
-    has_return = bool(route.get("return_date"))
     params = {
         "engine": "google_flights",
         "api_key": SERPAPI_API_KEY,
-        "departure_id": route["origin"],
-        "arrival_id": route["destination"],
-        "outbound_date": route["departure_date"],
-        "adults": route.get("adults", 1),
+        # Google Flights/SerpAPI have no distinct fare tier for teens (12-17) —
+        # only Adults, Children (2-11), and Infants. Teens fly on adult fares,
+        # so they're folded into the adults count sent to the API; "teens" is
+        # tracked separately only so routes.json/Telegram can label them.
+        "adults": route.get("adults", 1) + route.get("teens", 0),
         "travel_class": travel_class,
         # SerpAPI stops: 0 = any, 1 = nonstop only
         "stops": 1 if route.get("non_stop", True) else 0,
         "currency": CURRENCY,
-        # SerpAPI type: 1 = round trip, 2 = one way
-        "type": 1 if has_return else 2,
     }
-    if has_return:
-        params["return_date"] = route["return_date"]
+    if route.get("max_duration_hours"):
+        # routes.json takes hours (more natural to configure); SerpAPI's
+        # max_duration param wants minutes.
+        params["max_duration"] = round(float(route["max_duration_hours"]) * 60)
+    if is_legs:
+        # SerpAPI type: 3 = multi-city. Each leg is its own {departure_id,
+        # arrival_id, date} — no top-level departure_id/arrival_id/outbound_date.
+        params["type"] = 3
+        params["multi_city_json"] = json.dumps(
+            [
+                {
+                    "departure_id": leg["origin"],
+                    "arrival_id": leg["destination"],
+                    "date": leg["date"],
+                }
+                for leg in route["legs"]
+            ]
+        )
+        if MULTI_CITY_DEEP_SEARCH:
+            params["deep_search"] = "true"
+    else:
+        has_return = bool(route.get("return_date"))
+        params["departure_id"] = route["origin"]
+        params["arrival_id"] = route["destination"]
+        params["outbound_date"] = route["departure_date"]
+        # SerpAPI type: 1 = round trip, 2 = one way
+        params["type"] = 1 if has_return else 2
+        if has_return:
+            params["return_date"] = route["return_date"]
 
     try:
         resp = requests.get(SERPAPI_BASE, params=params, timeout=30)
@@ -599,7 +679,7 @@ def search_cheapest(route: dict) -> dict | None:
     record_call()
     if resp.status_code != 200:
         log(f"  API error {resp.status_code}: {resp.text[:200]}{log_searches_left()}")
-        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
+        label = route_label(route)
         _maybe_alert_quota(label, resp.status_code, resp.text)
         return None
 
@@ -611,7 +691,7 @@ def search_cheapest(route: dict) -> dict | None:
     archive_response(route, params, data)
     if data.get("error"):
         log(f"  API error: {data['error']}")
-        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
+        label = route_label(route)
         _maybe_alert_quota(label, resp.status_code, str(data["error"]))
         return None
 
@@ -635,15 +715,20 @@ def search_cheapest(route: dict) -> dict | None:
             return None
 
     # SerpAPI's "stops" param only distinguishes nonstop vs. any — cap at one
-    # stop client-side since 2+ stop itineraries are never wanted.
-    kept = [f for f in candidates if len(f.get("layovers", [])) <= 1]
-    dropped = len(candidates) - len(kept)
-    if dropped:
-        log(f"  Excluded {dropped} itinerary(ies) with 2+ stops.")
-    candidates = kept
-    if not candidates:
-        log("  No itineraries left after excluding 2+ stop options.")
-        return None
+    # stop client-side since 2+ stop itineraries are never wanted. Multi-leg
+    # (legs) routes skip this: a legitimate 3+ leg itinerary can have one
+    # connection per leg, which would look like "2+ stops" in aggregate even
+    # though every leg is individually fine — trust SerpAPI's own stops param
+    # for those instead of trying to re-partition segments back into legs.
+    if not is_legs:
+        kept = [f for f in candidates if len(f.get("layovers", [])) <= 1]
+        dropped = len(candidates) - len(kept)
+        if dropped:
+            log(f"  Excluded {dropped} itinerary(ies) with 2+ stops.")
+        candidates = kept
+        if not candidates:
+            log("  No itineraries left after excluding 2+ stop options.")
+            return None
 
     candidates.sort(key=lambda f: f["price"])
     cheapest = candidates[0]
@@ -713,7 +798,23 @@ def format_telegram(route: dict, offer: dict, icon: str,
     """Build the full Telegram alert message for a route check."""
     price = offer["price"]
     adults = route.get("adults", 1)
-    header = f"{icon} {route['origin']} → {route['destination']} ({adults} pax)"
+    teens = route.get("teens", 0)
+    # Teens fly on adult fares (see search_cheapest) — labeled separately here
+    # purely so the alert reflects who's actually traveling.
+    if teens:
+        pax = f"{adults} adult{'s' if adults != 1 else ''} + {teens} teen{'s' if teens != 1 else ''}"
+    else:
+        pax = f"{adults} pax"
+    is_legs = _is_legs_route(route)
+    if is_legs:
+        legs = route.get("legs") or []
+        chain = " → ".join(
+            [str((legs[0] or {}).get("origin", "?"))]
+            + [str((leg or {}).get("destination", "?")) for leg in legs]
+        )
+        header = f"{icon} {chain} ({pax})"
+    else:
+        header = f"{icon} {route['origin']} → {route['destination']} ({pax})"
 
     # Price + change + flight summary — all on one line
     price_str = f"{CURRENCY} {_format_price(price)}"
@@ -738,6 +839,18 @@ def format_telegram(route: dict, offer: dict, icon: str,
     if dur:
         parts.append(f"{dur // 60}h {dur % 60:02d}m")
     summary = " · ".join(parts)
+
+    if is_legs:
+        # Precise per-leg flight times aren't available without partitioning
+        # the combined itinerary's segments back into their originating legs
+        # (not done — see the stops-filtering note above), so just list each
+        # leg's route and date.
+        leg_lines = [
+            f"Leg {i + 1}: {leg.get('origin', '?')} → {leg.get('destination', '?')} | "
+            f"{_format_date(leg.get('date', ''))}"
+            for i, leg in enumerate(legs)
+        ]
+        return "\n".join([header, summary, ""] + leg_lines)
 
     # Outbound itinerary
     dep_raw = offer.get("departure_time")
@@ -840,25 +953,48 @@ def run_scan(days: int) -> None:
     log(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
 
     for route in routes:
-        base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
-        base_ret = (
-            datetime.strptime(route["return_date"], "%Y-%m-%d").date()
-            if route.get("return_date")
-            else None
-        )
+        is_legs = _is_legs_route(route)
+        if is_legs:
+            legs = route.get("legs") or []
+            anchor = datetime.strptime(legs[0]["date"], "%Y-%m-%d").date()
+        else:
+            base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
+            base_ret = (
+                datetime.strptime(route["return_date"], "%Y-%m-%d").date()
+                if route.get("return_date")
+                else None
+            )
+            anchor = base_dep
         # Match the price-history key format ("ORIGIN-DEST DATE") so multiple
         # routes sharing an origin/destination but differing by date don't
         # collide and overwrite each other in flex_scans.
-        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
+        label = route_label(route)
         log(f"Scanning {label} ...")
 
         results: list[dict] = []
         for off in offsets:
-            dep = base_dep + timedelta(days=off)
             probe = dict(route)
-            probe["departure_date"] = dep.isoformat()
-            if base_ret is not None:
-                probe["return_date"] = (base_ret + timedelta(days=off)).isoformat()
+            if is_legs:
+                # Shift every leg's date by the same offset, preserving the
+                # gaps between legs — the multi-leg equivalent of shifting
+                # return_date alongside departure_date for a round trip.
+                probe["legs"] = [
+                    {
+                        **leg,
+                        "date": (
+                            datetime.strptime(leg["date"], "%Y-%m-%d").date()
+                            + timedelta(days=off)
+                        ).isoformat(),
+                    }
+                    for leg in legs
+                ]
+                date_key = probe["legs"][0]["date"]
+            else:
+                dep = base_dep + timedelta(days=off)
+                probe["departure_date"] = dep.isoformat()
+                if base_ret is not None:
+                    probe["return_date"] = (base_ret + timedelta(days=off)).isoformat()
+                date_key = dep.isoformat()
 
             try:
                 offer = search_cheapest(probe)
@@ -866,28 +1002,28 @@ def run_scan(days: int) -> None:
                 price = offer["price"] if offer else None
             except Exception as e:
                 increment_call_count(state, 1)
-                log(f"  {dep.isoformat()}: error ({e}){log_searches_left()}")
+                log(f"  {date_key}: error ({e}){log_searches_left()}")
                 results.append(
-                    {"date": dep.isoformat(), "return_date": probe.get("return_date"), "price": None}
+                    {"date": date_key, "return_date": probe.get("return_date"), "price": None}
                 )
                 continue
             results.append(
                 {
-                    "date": dep.isoformat(),
+                    "date": date_key,
                     "return_date": probe.get("return_date"),
                     "price": price,
                 }
             )
             marker = "  ← base" if off == 0 else ""
             price_str = f"{CURRENCY} {price:.2f}" if price is not None else "no offers"
-            log(f"  {dep.isoformat()}: {price_str}{marker}{log_searches_left()}")
+            log(f"  {date_key}: {price_str}{marker}{log_searches_left()}")
 
         priced = [r for r in results if r["price"] is not None]
         cheapest = min(priced, key=lambda r: r["price"]) if priced else None
-        base = next((r for r in results if r["date"] == base_dep.isoformat()), None)
+        base = next((r for r in results if r["date"] == anchor.isoformat()), None)
         flex[label] = {
             "scanned": now_str,
-            "base_date": base_dep.isoformat(),
+            "base_date": anchor.isoformat(),
             "days": days,
             "results": results,
             "cheapest": cheapest,
@@ -1018,8 +1154,8 @@ def main() -> None:
     now_str = current_local_time().isoformat()
 
     for route in routes:
-        label = f"{route['origin']}-{route['destination']} {route['departure_date']}"
         try:
+            label = route_label(route)
             log(f"Checking {label} ...")
 
             offer = search_cheapest(route)
