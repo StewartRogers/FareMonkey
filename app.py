@@ -365,6 +365,20 @@ def route_label(route: dict) -> str:
     return f"{route.get('origin', '?')}-{route.get('destination', '?')} {route.get('departure_date', '?')}"
 
 
+def route_search_cost(route: dict) -> int:
+    """Real SerpAPI searches one check of this route costs.
+
+    Mirrors flight_monitor.route_search_cost(): a legs-shaped route is priced
+    as one independent one-way search per leg (see
+    flight_monitor._search_multi_leg), not a single multi-city call, so its
+    cost is len(legs), not 1.
+    """
+    legs = route.get("legs")
+    if isinstance(legs, list):
+        return len(legs)
+    return 1
+
+
 def route_times(route: dict) -> list[str]:
     """The clock times a route declares, normalized. Empty means 'every firing'."""
     times = route.get("run_times")
@@ -408,10 +422,12 @@ def schedule_plan(routes=None) -> dict:
     published = current_schedule()
 
     scheduled, unscheduled, legacy = {}, [], []
+    cost_by_label = {}
     for route in routes:
         if not isinstance(route, dict):
             continue
         label = route_label(route)
+        cost_by_label[label] = route_search_cost(route)
         times = route_times(route)
         if times:
             scheduled[label] = times
@@ -445,7 +461,9 @@ def schedule_plan(routes=None) -> dict:
         ]
         by_time[t] = sorted(at_this_time)
 
-    searches_per_day = sum(len(labels) for labels in by_time.values())
+    searches_per_day = sum(
+        cost_by_label.get(label, 1) for labels in by_time.values() for label in labels
+    )
     start, end = active_window()
     return {
         "times": union,
