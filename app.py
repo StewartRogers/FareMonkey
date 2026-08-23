@@ -8,6 +8,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import zoneinfo
+from datetime import datetime
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
@@ -26,6 +28,7 @@ STATE_FILE = BASE_DIR / "state.json"
 ROUTES_FILE = BASE_DIR / "routes.json"
 MONITOR_SCRIPT = BASE_DIR / "flight_monitor.py"
 CURRENCY = os.environ.get("CURRENCY", "USD")
+TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 
 TRAVEL_CLASSES = ("ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST")
 REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
@@ -204,6 +207,11 @@ def normalize_time(value: str) -> str:
     return f"{int(hour):02d}:{int(minute):02d}"
 
 
+def current_month_key() -> str:
+    """Mirrors flight_monitor.month_key(): the "YYYY-MM" api_calls is keyed by."""
+    return datetime.now(zoneinfo.ZoneInfo(TIMEZONE)).strftime("%Y-%m")
+
+
 @app.route("/")
 def dashboard():
     state = load_json(STATE_FILE)
@@ -244,12 +252,28 @@ def dashboard():
             "details": info.get("details"),
         })
 
-    total_calls = sum(api_calls.values())
+    # Prefer SerpAPI's own real usage (persisted by flight_monitor.py's
+    # sync_and_persist_account_quota(), free to refresh) over the locally-counted
+    # api_calls, which only sees searches made through this script and drifts
+    # from the account's actual usage (e.g. calls made via the SerpAPI dashboard
+    # directly). Only trust it if it was synced this month — a stale prior-month
+    # sync (e.g. the monitor hasn't run yet this month) would understate usage.
+    month_key = current_month_key()
+    account_usage = state.get("account_usage") or {}
+    real_usage = account_usage.get("this_month_usage")
+    synced_this_month = (account_usage.get("synced") or "").startswith(month_key)
+    if real_usage is not None and synced_this_month:
+        total_calls = real_usage
+        usage_is_real = True
+    else:
+        total_calls = api_calls.get(month_key, 0)
+        usage_is_real = False
 
     return render_template(
         "dashboard.html",
         routes=route_data,
         currency=CURRENCY,
+        usage_is_real=usage_is_real,
         api_calls=api_calls,
         total_calls=total_calls,
         last_run=last_run,
@@ -423,11 +447,22 @@ def schedule_plan(routes=None) -> dict:
 
     scheduled, unscheduled, legacy = {}, [], []
     cost_by_label = {}
+    leg_chains = {}
     for route in routes:
         if not isinstance(route, dict):
             continue
         label = route_label(route)
         cost_by_label[label] = route_search_cost(route)
+        legs = route.get("legs")
+        if isinstance(legs, list) and legs:
+            # route_label() joins the chain as if each leg picks up where the last
+            # left off (e.g. "YVR-HEL-BER-YVR"), which reads fine for a closed loop
+            # but hides a gap when legs aren't contiguous (e.g. a leg skipped to cut
+            # cost). Spell out each leg on its own so that's never ambiguous.
+            leg_chains[label] = [
+                f"{(leg or {}).get('origin', '?')}-{(leg or {}).get('destination', '?')}"
+                for leg in legs
+            ]
         times = route_times(route)
         if times:
             scheduled[label] = times
@@ -468,6 +503,7 @@ def schedule_plan(routes=None) -> dict:
     return {
         "times": union,
         "by_time": by_time,
+        "leg_chains": leg_chains,
         "unscheduled": sorted(unscheduled),
         "legacy": legacy,
         "searches_per_day": searches_per_day,

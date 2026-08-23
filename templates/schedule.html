@@ -92,13 +92,41 @@
       return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
     }
 
+    // Turns ["YVR-HEL","HEL-BER","BER-YVR"] into "YVR ✈ HEL ✈ BER ✈ YVR", chaining
+    // each leg onto the last as long as it picks up where the previous one left
+    // off, and starting a new "✈"-joined segment when a leg skips ahead instead
+    // of pretending the itinerary is one unbroken trip.
+    function legsToFlightPath(legs) {
+      const segments = [];
+      let current = null;
+      legs.forEach(leg => {
+        const [from, to] = leg.split('-');
+        if (current && current[current.length - 1] === from) {
+          current.push(to);
+        } else {
+          current = [from, to];
+          segments.push(current);
+        }
+      });
+      return segments.map(seg => seg.join(' ✈ ')).join('  |  ');
+    }
+
     function render(plan) {
       const conflicts = plan.outside_active_hours || [];
       tbody.innerHTML = (plan.times || []).map(t => {
         const labels = (plan.by_time && plan.by_time[t]) || [];
         const bad = conflicts.includes(t);
+        const chains = plan.leg_chains || {};
         const routes = labels.length
-          ? labels.map(esc).join('<br>')
+          ? labels.map(label => {
+              const legs = chains[label];
+              if (!legs || !legs.length) return esc(label);
+              // Multi-leg routes: show the flight path instead of the collapsed
+              // chain label, which reads as one contiguous trip even when a leg
+              // was deliberately skipped (e.g. a gap in the itinerary).
+              const date = label.split(' ').pop();
+              return `${esc(legsToFlightPath(legs))} <span class="every" style="font-size:0.78rem">${esc(date)}</span>`;
+            }).join('<br>')
           : '<span class="every">no routes</span>';
         return `<tr>
           <td class="time ${bad ? 'bad' : ''}">${esc(t)}${bad ? ' ⚠' : ''}</td>

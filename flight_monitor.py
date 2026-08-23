@@ -381,6 +381,27 @@ def sync_account_quota() -> int | None:
         return None
 
 
+def sync_and_persist_account_quota() -> int | None:
+    """sync_account_quota(), then persist the real SerpAPI usage to state.json.
+
+    state.json's own `api_calls` counter only sees searches made through this
+    script and can drift from the account's actual usage (see can_make_calls()).
+    Persisting the real numbers here lets the dashboard show SerpAPI's own count
+    instead of the locally-recorded one, which this call doesn't cost a search
+    credit to refresh.
+    """
+    left = sync_account_quota()
+    if _this_month_usage is not None:
+        state = load_json(STATE_FILE)
+        state["account_usage"] = {
+            "this_month_usage": _this_month_usage,
+            "searches_left": _searches_left,
+            "synced": current_local_time().isoformat(),
+        }
+        save_json(STATE_FILE, state)
+    return left
+
+
 def decrement_searches_left() -> None:
     """Decrement the local remaining-searches counter after a search call."""
     global _searches_left
@@ -997,7 +1018,7 @@ def run_scan(days: int) -> None:
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
 
-    sync_account_quota()
+    sync_and_persist_account_quota()
     routes = load_routes()
 
     state = load_json(STATE_FILE)
@@ -1164,7 +1185,7 @@ def main() -> None:
     if not SERPAPI_API_KEY:
         sys.exit("Error: SERPAPI_API_KEY must be set.")
 
-    sync_account_quota()
+    sync_and_persist_account_quota()
 
     if not is_within_active_hours():
         if not force:
