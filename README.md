@@ -61,7 +61,7 @@ Fields: `origin` and `destination` are IATA airport codes. `departure_date` is r
 }
 ```
 
-`adults`/`teens`/`non_stop`/`travel_class`/`max_duration_hours`/`run_times` all still apply. This still costs one SerpAPI search per check, same as any other route. Build one from the `/routes` editor's "+ Add multi-leg route" button, or by hand-editing `routes.json`.
+`adults`/`teens`/`non_stop`/`travel_class`/`max_duration_hours`/`run_times` all still apply. Each leg is priced as its own independent one-way search and the prices are summed, so an N-leg route costs **N** SerpAPI searches per check, not 1 — see "Quota math" below. (SerpAPI's own multi-city API only returns pricing for the first leg in a single call; summing independent legs avoids relying on its undocumented multi-step continuation flow and — unlike that first-leg-only price — never understates the real cost.) Build one from the `/routes` editor's "+ Add multi-leg route" button, or by hand-editing `routes.json`.
 
 **Routes decide when the monitor runs.** The crontab is the union of every route's `run_times`, so adding a time to a route adds a firing and removing the last route that used a time removes it. A route with no `run_times` is checked at *every* firing the other routes schedule. The dashboard's Schedule page shows that union — which routes fire at each time and what it costs in searches — and installs it (see "Schedule" below). The older `run_hours` field (a list of hours that could only *filter* firings the crontab already had, never create one) still works: the Schedule page maps those hours onto real times — reusing the published firing's minutes where there is one — so publishing before you migrate keeps the route running, and the routes editor converts the field to `run_times` when you save.
 
@@ -196,10 +196,11 @@ return date shifts by the same number of days). Results are saved to `state.json
 under `flex_scans` and shown on the dashboard as a date grid with the best day
 highlighted; a Telegram summary is sent if alerts are configured.
 
-> **Budget note:** a scan costs one SerpAPI search *per date in the window*, so it
-> is **not** part of the scheduled cron — run it deliberately when planning. The
-> `MONTHLY_CALL_CAP` is still enforced; an over-cap scan is refused before any
-> calls are made.
+> **Budget note:** a scan costs one SerpAPI search *per date in the window* for a
+> simple route, or N searches per date for an N-leg multi-leg route (each leg is
+> its own search — see "Quota math" below), so it is **not** part of the
+> scheduled cron — run it deliberately when planning. The `MONTHLY_CALL_CAP` is
+> still enforced; an over-cap scan is refused before any calls are made.
 
 ### 7. GitHub Actions (manual smoke test only)
 
@@ -246,7 +247,6 @@ Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*.
 | `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
 | `RETENTION_DAYS` | No | `30` | Prune history and archived responses older than this (each run) |
 | `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that connect through a US airport (nonstop and non-US connections kept) |
-| `MULTI_CITY_DEEP_SEARCH` | No | `false` | Adds `deep_search=true` to multi-leg (`legs`) route searches only — extra cost/latency, sometimes needed to match Google Flights' website for multi-city itineraries |
 | `FLASK_DEBUG` | No | `false` | Enable Flask debug mode for the dashboard (`app.py`) — local development only |
 
 ## SerpAPI account sync & quota alerts
@@ -284,12 +284,13 @@ To keep these local files from growing forever, each monitor run prunes the in-s
 
 ## Quota math
 
-SerpAPI charges **1 search per route per run** — there is no separate token/auth request. Budget your runs against your plan's monthly search allowance.
+SerpAPI charges **1 search per simple route per run** — there is no separate token/auth request. A **multi-leg route costs N searches for N legs**: each leg is priced as its own independent one-way search rather than one combined multi-city call (SerpAPI's actual multi-city API only prices the first leg in a single request — see "Multi-leg (multi-city) trips" above). Budget your runs against your plan's monthly search allowance; the `/schedule` page's search-budget figure already accounts for this per-route.
 
 | Resource | Calls |
 |----------|-------|
-| Flight search (per route) | 1 per run |
-| **Total per run** (2 routes) | **2** |
+| Flight search (per simple route) | 1 per run |
+| Flight search (per N-leg route) | N per run |
+| **Total per run** (2 simple routes) | **2** |
 | Runs per day (7:30, 13:30, 19:30) | **3** |
 | **Calls per day** | **6** |
 | **Calls per month** (30 days) | **~180** |

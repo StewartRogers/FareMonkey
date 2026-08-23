@@ -50,10 +50,6 @@ MONTHLY_CALL_CAP = int(os.environ.get("MONTHLY_CALL_CAP", "240"))
 MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "1000"))
 # When true, drop any itinerary that connects through a US airport (see US_HUBS).
 EXCLUDE_US_CONNECTIONS = os.environ.get("EXCLUDE_US_CONNECTIONS", "false").lower() in ("1", "true", "yes", "on")
-# When true, ask SerpAPI for a deep_search on multi-leg (legs) routes only. SerpAPI's
-# docs flag multi-city as a case where results may not match the Google Flights
-# website without it, at extra cost and slower response time. Off by default.
-MULTI_CITY_DEEP_SEARCH = os.environ.get("MULTI_CITY_DEEP_SEARCH", "false").lower() in ("1", "true", "yes", "on")
 ARCHIVE_RESPONSES = os.environ.get("ARCHIVE_RESPONSES", "true").lower() in ("1", "true", "yes", "on")
 RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 
@@ -618,9 +614,90 @@ def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
     return True
 
 
+def route_search_cost(route: dict) -> int:
+    """Real SerpAPI searches one check of this route costs.
+
+    search_cheapest() prices a multi-leg route as N independent one-way
+    searches (see _search_multi_leg) rather than a single multi-city call, so
+    its cost is len(legs), not 1 — callers that pre-check MONTHLY_CALL_CAP or
+    track state.json's api_calls counter need the real count, not a per-route
+    flat 1.
+    """
+    if _is_legs_route(route):
+        return len(route.get("legs") or [])
+    return 1
+
+
+def _search_multi_leg(route: dict) -> dict | None:
+    """Price a multi-leg (multi-city) route as the sum of independent one-way
+    searches, one per leg (N real SerpAPI searches for N legs).
+
+    Google Flights/SerpAPI's actual multi-city flow only prices the first leg
+    in a single multi_city_json call — getting the true combined through-fare
+    requires chaining departure_token through each remaining leg, and we don't
+    have a verified read on that continuation response's shape. Summing
+    independent one-way legs sidesteps that: it reuses the already-correct
+    one-way search path below (so each leg gets its own stop-count/US-connection
+    filtering "for free"), and is safely biased toward *overstating* the real
+    price rather than silently understating it the way a naive single
+    multi-city call does (that call only returns leg 1's price).
+    """
+    shared = {
+        k: route[k]
+        for k in ("adults", "teens", "non_stop", "travel_class", "max_duration_hours")
+        if k in route
+    }
+    leg_offers = []
+    for leg in route["legs"]:
+        offer = search_cheapest({
+            **shared,
+            "origin": leg["origin"],
+            "destination": leg["destination"],
+            "departure_date": leg["date"],
+        })
+        if offer is None:
+            # Can't price the whole trip if any leg has no offers.
+            return None
+        leg_offers.append(offer)
+
+    airlines: list[str] = []
+    for o in leg_offers:
+        for a in o.get("airlines") or []:
+            if a not in airlines:
+                airlines.append(a)
+
+    return {
+        "price": sum(o["price"] for o in leg_offers),
+        "airlines": airlines,
+        "stops": sum(o.get("stops", 0) for o in leg_offers),
+        "total_duration": sum(o.get("total_duration") or 0 for o in leg_offers),
+        "legs": [
+            {
+                "origin": leg["origin"],
+                "destination": leg["destination"],
+                "date": leg["date"],
+                "price": o["price"],
+                "airlines": o.get("airlines"),
+                "stops": o.get("stops"),
+                "departure_time": o.get("departure_time"),
+                "arrival_time": o.get("arrival_time"),
+                "total_duration": o.get("total_duration"),
+            }
+            for leg, o in zip(route["legs"], leg_offers)
+        ],
+    }
+
+
 def search_cheapest(route: dict) -> dict | None:
-    """Return the cheapest option (price + details) for a route, or None on failure."""
-    is_legs = _is_legs_route(route)
+    """Return the cheapest option (price + details) for a route, or None on failure.
+
+    Multi-leg (legs) routes are delegated to _search_multi_leg() — see there
+    for why they're priced as N independent one-way searches rather than one
+    multi-city call.
+    """
+    if _is_legs_route(route):
+        return _search_multi_leg(route)
+
     travel_class = TRAVEL_CLASS_MAP.get(
         str(route.get("travel_class", "ECONOMY")).upper(), 1
     )
@@ -641,31 +718,14 @@ def search_cheapest(route: dict) -> dict | None:
         # routes.json takes hours (more natural to configure); SerpAPI's
         # max_duration param wants minutes.
         params["max_duration"] = round(float(route["max_duration_hours"]) * 60)
-    if is_legs:
-        # SerpAPI type: 3 = multi-city. Each leg is its own {departure_id,
-        # arrival_id, date} — no top-level departure_id/arrival_id/outbound_date.
-        params["type"] = 3
-        params["multi_city_json"] = json.dumps(
-            [
-                {
-                    "departure_id": leg["origin"],
-                    "arrival_id": leg["destination"],
-                    "date": leg["date"],
-                }
-                for leg in route["legs"]
-            ]
-        )
-        if MULTI_CITY_DEEP_SEARCH:
-            params["deep_search"] = "true"
-    else:
-        has_return = bool(route.get("return_date"))
-        params["departure_id"] = route["origin"]
-        params["arrival_id"] = route["destination"]
-        params["outbound_date"] = route["departure_date"]
-        # SerpAPI type: 1 = round trip, 2 = one way
-        params["type"] = 1 if has_return else 2
-        if has_return:
-            params["return_date"] = route["return_date"]
+    has_return = bool(route.get("return_date"))
+    params["departure_id"] = route["origin"]
+    params["arrival_id"] = route["destination"]
+    params["outbound_date"] = route["departure_date"]
+    # SerpAPI type: 1 = round trip, 2 = one way
+    params["type"] = 1 if has_return else 2
+    if has_return:
+        params["return_date"] = route["return_date"]
 
     try:
         resp = requests.get(SERPAPI_BASE, params=params, timeout=30)
@@ -715,20 +775,18 @@ def search_cheapest(route: dict) -> dict | None:
             return None
 
     # SerpAPI's "stops" param only distinguishes nonstop vs. any — cap at one
-    # stop client-side since 2+ stop itineraries are never wanted. Multi-leg
-    # (legs) routes skip this: a legitimate 3+ leg itinerary can have one
-    # connection per leg, which would look like "2+ stops" in aggregate even
-    # though every leg is individually fine — trust SerpAPI's own stops param
-    # for those instead of trying to re-partition segments back into legs.
-    if not is_legs:
-        kept = [f for f in candidates if len(f.get("layovers", [])) <= 1]
-        dropped = len(candidates) - len(kept)
-        if dropped:
-            log(f"  Excluded {dropped} itinerary(ies) with 2+ stops.")
-        candidates = kept
-        if not candidates:
-            log("  No itineraries left after excluding 2+ stop options.")
-            return None
+    # stop client-side since 2+ stop itineraries are never wanted. This runs
+    # for every call this function makes, including each leg of a multi-leg
+    # route (via _search_multi_leg), so multi-leg itineraries get the same
+    # per-leg stop cap as any other route.
+    kept = [f for f in candidates if len(f.get("layovers", [])) <= 1]
+    dropped = len(candidates) - len(kept)
+    if dropped:
+        log(f"  Excluded {dropped} itinerary(ies) with 2+ stops.")
+    candidates = kept
+    if not candidates:
+        log("  No itineraries left after excluding 2+ stop options.")
+        return None
 
     candidates.sort(key=lambda f: f["price"])
     cheapest = candidates[0]
@@ -841,15 +899,25 @@ def format_telegram(route: dict, offer: dict, icon: str,
     summary = " · ".join(parts)
 
     if is_legs:
-        # Precise per-leg flight times aren't available without partitioning
-        # the combined itinerary's segments back into their originating legs
-        # (not done — see the stops-filtering note above), so just list each
-        # leg's route and date.
-        leg_lines = [
-            f"Leg {i + 1}: {leg.get('origin', '?')} → {leg.get('destination', '?')} | "
-            f"{_format_date(leg.get('date', ''))}"
-            for i, leg in enumerate(legs)
-        ]
+        # Each leg was priced as its own independent search (see
+        # _search_multi_leg), so offer["legs"] carries real per-leg flight
+        # times and prices, not just the route definition's dates.
+        leg_lines = []
+        for i, leg in enumerate(offer.get("legs") or []):
+            date_str = _format_date(str(leg.get("date", "")))
+            dep_raw = leg.get("departure_time")
+            arr_raw = leg.get("arrival_time")
+            if dep_raw and arr_raw:
+                plus = _overnight(dep_raw, arr_raw)
+                times = f"{dep_raw[11:]} → {arr_raw[11:]}{plus}"
+            else:
+                times = "flight times not available"
+            leg_price = leg.get("price")
+            price_part = f" | {CURRENCY} {_format_price(leg_price)}" if leg_price is not None else ""
+            leg_lines.append(
+                f"Leg {i + 1}: {leg.get('origin', '?')} → {leg.get('destination', '?')} | "
+                f"{date_str} | {times}{price_part}"
+            )
         return "\n".join([header, summary, ""] + leg_lines)
 
     # Outbound itinerary
@@ -934,7 +1002,7 @@ def run_scan(days: int) -> None:
 
     state = load_json(STATE_FILE)
     offsets = list(range(-days, days + 1))
-    needed = len(routes) * len(offsets)
+    needed = sum(route_search_cost(r) for r in routes) * len(offsets)
     if not can_make_calls(needed):
         usage = current_usage()
         if usage is None:
@@ -998,10 +1066,10 @@ def run_scan(days: int) -> None:
 
             try:
                 offer = search_cheapest(probe)
-                increment_call_count(state, 1)
+                increment_call_count(state, route_search_cost(probe))
                 price = offer["price"] if offer else None
             except Exception as e:
-                increment_call_count(state, 1)
+                increment_call_count(state, route_search_cost(probe))
                 log(f"  {date_key}: error ({e}){log_searches_left()}")
                 results.append(
                     {"date": date_key, "return_date": probe.get("return_date"), "price": None}
@@ -1123,8 +1191,9 @@ def main() -> None:
 
     state = load_json(STATE_FILE)
 
-    # 1 search call per route (SerpAPI uses a single API key, no token call)
-    calls_needed = len(routes)
+    # 1 search call per simple route, N per N-leg multi-leg route (SerpAPI uses
+    # a single API key, no separate token call).
+    calls_needed = sum(route_search_cost(r) for r in routes)
     if not can_make_calls(calls_needed):
         usage = current_usage()
         if usage is None:
@@ -1159,7 +1228,7 @@ def main() -> None:
             log(f"Checking {label} ...")
 
             offer = search_cheapest(route)
-            increment_call_count(state, 1)
+            increment_call_count(state, route_search_cost(route))
 
             if offer is None:
                 log(f"  No offers found for {label}")

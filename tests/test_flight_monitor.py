@@ -689,11 +689,29 @@ class TestFormatTelegram:
         lines = msg.split("\n")
         assert lines[0] == "🐒 JFK → HEL → BER → JFK (1 pax)"
 
+    LEGS_OFFER = {
+        "price": 6000.0,
+        "airlines": ["Finnair", "Lufthansa"],
+        "stops": 0,
+        "total_duration": 900,
+        "legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15", "price": 1000.0,
+             "departure_time": "2026-09-15 08:00", "arrival_time": "2026-09-15 20:00"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20", "price": 2000.0,
+             "departure_time": "2026-09-20 09:00", "arrival_time": "2026-09-20 11:00"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25", "price": 3000.0,
+             "departure_time": None, "arrival_time": None},
+        ],
+    }
+
     def test_legs_lists_each_leg(self):
-        msg = fm.format_telegram(self.LEGS_ROUTE, self.OFFER, "🐒", None)
-        assert "Leg 1: JFK → HEL | Sep 15" in msg
-        assert "Leg 2: HEL → BER | Sep 20" in msg
-        assert "Leg 3: BER → JFK | Sep 25" in msg
+        # Pin CURRENCY: it is read from the environment at import, so a local
+        # .env would otherwise decide whether this assertion holds.
+        with mock.patch.object(fm, "CURRENCY", "USD"):
+            msg = fm.format_telegram(self.LEGS_ROUTE, self.LEGS_OFFER, "🐒", None)
+        assert "Leg 1: JFK → HEL | Sep 15 | 08:00 → 20:00 | USD 1,000" in msg
+        assert "Leg 2: HEL → BER | Sep 20 | 09:00 → 11:00 | USD 2,000" in msg
+        assert "Leg 3: BER → JFK | Sep 25 | flight times not available | USD 3,000" in msg
 
     def test_legs_no_outbound_inbound_wording(self):
         msg = fm.format_telegram(self.LEGS_ROUTE, self.OFFER, "🐒", None)
@@ -1075,57 +1093,101 @@ class TestSearchCheapest:
         "adults": 2, "non_stop": False, "travel_class": "BUSINESS",
     }
 
-    def test_legs_route_params(self):
-        resp = self._make_response(best=[self._flight(4000)])
-        with mock.patch("requests.get", return_value=resp) as mock_get, \
-             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
-             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
-            offer = fm.search_cheapest(self.LEGS_ROUTE)
-        call_params = mock_get.call_args[1]["params"]
-        assert call_params["type"] == 3
-        legs_sent = json.loads(call_params["multi_city_json"])
-        assert legs_sent == [
-            {"departure_id": "JFK", "arrival_id": "HEL", "date": "2026-09-15"},
-            {"departure_id": "HEL", "arrival_id": "BER", "date": "2026-09-20"},
-            {"departure_id": "BER", "arrival_id": "JFK", "date": "2026-09-25"},
+    def test_legs_route_makes_one_one_way_search_per_leg(self):
+        # SerpAPI's multi-city (type=3) call only prices the first leg — see
+        # _search_multi_leg's docstring — so each leg is its own one-way
+        # (type=2) search instead of a single multi_city_json request.
+        responses = [
+            self._make_response(best=[self._flight(1000)]),
+            self._make_response(best=[self._flight(2000)]),
+            self._make_response(best=[self._flight(3000)]),
         ]
-        for key in ("departure_id", "arrival_id", "outbound_date", "return_date"):
-            assert key not in call_params
-        assert offer["price"] == 4000.0
-
-    def test_legs_route_deep_search_off_by_default(self):
-        resp = self._make_response(best=[self._flight(4000)])
-        with mock.patch("requests.get", return_value=resp) as mock_get, \
-             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
-             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False), \
-             mock.patch.object(fm, "MULTI_CITY_DEEP_SEARCH", False):
-            fm.search_cheapest(self.LEGS_ROUTE)
-        call_params = mock_get.call_args[1]["params"]
-        assert "deep_search" not in call_params
-
-    def test_legs_route_deep_search_enabled(self):
-        resp = self._make_response(best=[self._flight(4000)])
-        with mock.patch("requests.get", return_value=resp) as mock_get, \
-             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
-             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False), \
-             mock.patch.object(fm, "MULTI_CITY_DEEP_SEARCH", True):
-            fm.search_cheapest(self.LEGS_ROUTE)
-        call_params = mock_get.call_args[1]["params"]
-        assert call_params["deep_search"] == "true"
-
-    def test_legs_route_keeps_multi_stop_candidates(self):
-        # Unlike simple routes, legs routes don't cap total layovers at 1 — a
-        # legitimate 3-leg itinerary can have one connection per leg, which
-        # would look like "many stops" in aggregate even though each leg is
-        # individually fine.
-        many_stops = self._flight(3000, layovers=[{"id": "GDL"}, {"id": "MEX"}, {"id": "ORD"}])
-        resp = self._make_response(best=[many_stops])
-        with mock.patch("requests.get", return_value=resp), \
+        with mock.patch("requests.get", side_effect=responses) as mock_get, \
              mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
              mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
             offer = fm.search_cheapest(self.LEGS_ROUTE)
-        assert offer is not None
-        assert offer["price"] == 3000.0
+        assert mock_get.call_count == 3
+        calls = [c.kwargs["params"] for c in mock_get.call_args_list]
+        expected_legs = self.LEGS_ROUTE["legs"]
+        for call_params, leg in zip(calls, expected_legs):
+            assert call_params["type"] == 2
+            assert call_params["departure_id"] == leg["origin"]
+            assert call_params["arrival_id"] == leg["destination"]
+            assert call_params["outbound_date"] == leg["date"]
+            assert "multi_city_json" not in call_params
+            assert "return_date" not in call_params
+            # Shared route settings apply to every leg.
+            assert call_params["adults"] == 2
+            assert call_params["travel_class"] == fm.TRAVEL_CLASS_MAP["BUSINESS"]
+            assert call_params["stops"] == 0  # non_stop: False → any
+        assert offer["price"] == 6000.0  # 1000 + 2000 + 3000
+
+    def test_legs_route_offer_includes_per_leg_breakdown(self):
+        responses = [
+            self._make_response(best=[self._flight(1000, airline="Finnair")]),
+            self._make_response(best=[self._flight(2000, airline="Lufthansa")]),
+            self._make_response(best=[self._flight(3000, airline="Air Canada")]),
+        ]
+        with mock.patch("requests.get", side_effect=responses), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.LEGS_ROUTE)
+        assert [leg["price"] for leg in offer["legs"]] == [1000.0, 2000.0, 3000.0]
+        assert offer["legs"][0]["origin"] == "JFK"
+        assert offer["legs"][0]["destination"] == "HEL"
+        assert offer["legs"][0]["date"] == "2026-09-15"
+        assert offer["airlines"] == ["Finnair", "Lufthansa", "Air Canada"]
+
+    def test_legs_route_sums_stops_and_duration_across_legs(self):
+        responses = [
+            self._make_response(best=[self._flight(1000, layovers=[{"id": "GDL"}])]),
+            self._make_response(best=[self._flight(2000)]),
+            self._make_response(best=[self._flight(3000, layovers=[{"id": "MEX"}])]),
+        ]
+        with mock.patch("requests.get", side_effect=responses), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.LEGS_ROUTE)
+        assert offer["stops"] == 2  # 1 + 0 + 1
+        assert offer["total_duration"] == 480 * 3  # each _flight() fixture is 480 min
+
+    def test_legs_route_per_leg_stop_cap_still_applies(self):
+        # Multi-leg routes no longer skip the 2+-stop cap — each leg is
+        # searched via the normal one-way path, so a leg with only 2+-stop
+        # candidates has no valid offer, and the whole trip can't be priced.
+        too_many_stops = self._flight(3000, layovers=[{"id": "GDL"}, {"id": "MEX"}])
+        responses = [
+            self._make_response(best=[self._flight(1000)]),
+            self._make_response(best=[too_many_stops]),
+        ]
+        with mock.patch("requests.get", side_effect=responses), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.LEGS_ROUTE)
+        assert offer is None
+
+    def test_legs_route_none_if_any_leg_has_no_offers(self):
+        responses = [
+            self._make_response(best=[self._flight(1000)]),
+            self._make_response(best=[]),  # leg 2: no offers at all
+        ]
+        with mock.patch("requests.get", side_effect=responses), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.LEGS_ROUTE)
+        assert offer is None
+
+    def test_legs_route_teens_and_max_duration_apply_per_leg(self):
+        route = {**self.LEGS_ROUTE, "adults": 2, "teens": 2, "max_duration_hours": 20}
+        responses = [self._make_response(best=[self._flight(1000)]) for _ in range(3)]
+        with mock.patch("requests.get", side_effect=responses) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(route)
+        for call in mock_get.call_args_list:
+            assert call.kwargs["params"]["adults"] == 4
+            assert call.kwargs["params"]["max_duration"] == 1200
+
 
     def test_teens_folded_into_adults_param(self):
         route = {**self.ROUTE, "adults": 2, "teens": 2}
@@ -1169,6 +1231,19 @@ class TestSearchCheapest:
              mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
             fm.search_cheapest(self.ROUTE)
         assert "max_duration" not in mock_get.call_args[1]["params"]
+
+
+class TestRouteSearchCost:
+    def test_simple_route_costs_one(self):
+        assert fm.route_search_cost({"origin": "A", "destination": "B", "departure_date": "2026-01-01"}) == 1
+
+    def test_legs_route_costs_leg_count(self):
+        route = {"legs": [
+            {"origin": "A", "destination": "B", "date": "2026-01-01"},
+            {"origin": "B", "destination": "C", "date": "2026-01-05"},
+            {"origin": "C", "destination": "A", "date": "2026-01-10"},
+        ]}
+        assert fm.route_search_cost(route) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1297,3 +1372,13 @@ class TestRunScan:
 
         label = fm.route_label(self.SIMPLE_ROUTE)
         assert state["flex_scans"][label]["base_date"] == "2026-12-23"
+
+    def test_legs_route_call_count_reflects_leg_count(self, state_file):
+        # 3 legs × 3 offsets (-1/0/+1) = 9 real searches, not 3 — run_scan must
+        # use route_search_cost(), not a flat 1 per date, to track this.
+        _, state = self._run(self.LEGS_ROUTE, 1, state_file)
+        assert fm.get_call_count(state) == 9
+
+    def test_simple_route_call_count_is_one_per_offset(self, state_file):
+        _, state = self._run(self.SIMPLE_ROUTE, 1, state_file)
+        assert fm.get_call_count(state) == 3

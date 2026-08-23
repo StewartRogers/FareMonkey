@@ -530,6 +530,18 @@ class TestOutsideActiveHours:
         assert webapp.outside_active_hours(["05:00", "13:30"]) == ["05:00"]
 
 
+class TestRouteSearchCost:
+    def test_simple_route_costs_one(self):
+        assert webapp.route_search_cost({"origin": "A", "destination": "B", "departure_date": "2026-01-01"}) == 1
+
+    def test_legs_route_costs_leg_count(self):
+        route = {"legs": [
+            {"origin": "A", "destination": "B", "date": "2026-01-01"},
+            {"origin": "B", "destination": "C", "date": "2026-01-05"},
+        ]}
+        assert webapp.route_search_cost(route) == 2
+
+
 class TestSchedulePlan:
     def test_union_of_route_run_times(self, routes_file):
         routes_file.write_text(json.dumps([
@@ -621,6 +633,24 @@ class TestSchedulePlan:
         assert "YVR-FRA 2027-03-15" in labels
         assert "JFK-HEL-BER-JFK 2026-09-15" in labels
         assert "?-? ?" not in labels
+
+    def test_legs_route_search_budget_counts_one_per_leg(self, routes_file):
+        # A 3-leg route is priced as 3 independent one-way searches (see
+        # flight_monitor._search_multi_leg), so the /schedule page's search
+        # budget must count 3 for it, not 1 — understating this would let
+        # someone publish a schedule that actually exceeds their plan.
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30"]},
+            {"legs": [
+                {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+                {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+                {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+             ], "run_times": ["07:30"]},
+        ]))
+        plan = webapp.schedule_plan()
+        assert plan["searches_per_day"] == 4  # 1 simple route + 3 legs
+        assert plan["searches_per_month"] == 120
 
 
 class TestApiSchedule:
