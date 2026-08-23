@@ -29,6 +29,7 @@ CURRENCY = os.environ.get("CURRENCY", "USD")
 
 TRAVEL_CLASSES = ("ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST")
 REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
+REQUIRED_LEG_FIELDS = ("origin", "destination", "date")
 IATA_RE = re.compile(r"^[A-Z]{3}$")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
@@ -75,25 +76,55 @@ def validate_routes(routes) -> list[str]:
         if not isinstance(route, dict):
             errors.append(f"Route {i + 1}: must be an object")
             continue
-        for field in REQUIRED_ROUTE_FIELDS:
-            if not route.get(field):
-                errors.append(f"Route {i + 1}: missing required field '{field}'")
-        origin = route.get("origin")
-        if origin and not IATA_RE.match(str(origin).upper()):
-            errors.append(f"Route {i + 1}: origin must be a 3-letter IATA code")
-        destination = route.get("destination")
-        if destination and not IATA_RE.match(str(destination).upper()):
-            errors.append(f"Route {i + 1}: destination must be a 3-letter IATA code")
-        for date_field in ("departure_date", "return_date"):
-            value = route.get(date_field)
-            if value and not DATE_RE.match(str(value)):
-                errors.append(f"Route {i + 1}: {date_field} must be an ISO date (YYYY-MM-DD)")
+        if "legs" in route:
+            # Multi-leg (multi-city) route: no editor UI builds these yet (hand-edited
+            # into routes.json), so validation here is deliberately loose — just enough
+            # to keep an obviously-malformed entry from being silently saved.
+            legs = route.get("legs")
+            if not isinstance(legs, list) or len(legs) < 2:
+                errors.append(f"Route {i + 1}: 'legs' must be a list of at least 2 legs")
+            else:
+                for j, leg in enumerate(legs):
+                    missing = [
+                        f for f in REQUIRED_LEG_FIELDS if not (isinstance(leg, dict) and leg.get(f))
+                    ]
+                    if missing:
+                        errors.append(
+                            f"Route {i + 1} leg {j + 1}: missing required field(s): "
+                            f"{', '.join(missing)}"
+                        )
+        else:
+            for field in REQUIRED_ROUTE_FIELDS:
+                if not route.get(field):
+                    errors.append(f"Route {i + 1}: missing required field '{field}'")
+            origin = route.get("origin")
+            if origin and not IATA_RE.match(str(origin).upper()):
+                errors.append(f"Route {i + 1}: origin must be a 3-letter IATA code")
+            destination = route.get("destination")
+            if destination and not IATA_RE.match(str(destination).upper()):
+                errors.append(f"Route {i + 1}: destination must be a 3-letter IATA code")
+            for date_field in ("departure_date", "return_date"):
+                value = route.get(date_field)
+                if value and not DATE_RE.match(str(value)):
+                    errors.append(f"Route {i + 1}: {date_field} must be an ISO date (YYYY-MM-DD)")
         if "adults" in route and route["adults"] not in (None, ""):
             try:
                 if int(route["adults"]) < 1:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"Route {i + 1}: adults must be a positive integer")
+        if "teens" in route and route["teens"] not in (None, ""):
+            try:
+                if int(route["teens"]) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"Route {i + 1}: teens must be a non-negative integer")
+        if "max_duration_hours" in route and route["max_duration_hours"] not in (None, ""):
+            try:
+                if float(route["max_duration_hours"]) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"Route {i + 1}: max_duration_hours must be a positive number")
         travel_class = route.get("travel_class")
         if travel_class and travel_class not in TRAVEL_CLASSES:
             errors.append(f"Route {i + 1}: travel_class must be one of {', '.join(TRAVEL_CLASSES)}")
@@ -135,15 +166,26 @@ def outside_active_hours(times) -> list[str]:
 
 def normalize_route(route: dict) -> dict:
     """Coerce a validated route dict into the canonical shape/types for routes.json."""
-    out = {
-        "origin": str(route["origin"]).upper(),
-        "destination": str(route["destination"]).upper(),
-        "departure_date": route["departure_date"],
-    }
-    if route.get("return_date"):
-        out["return_date"] = route["return_date"]
+    if "legs" in route:
+        # The /routes editor already uppercases/shapes each leg client-side
+        # before posting — pass legs through as given rather than re-validating
+        # per-leg IATA/date formatting server-side (kept loose, like the rest
+        # of this legs branch, since routes.json can also be hand-edited).
+        out = {"legs": route.get("legs")}
+    else:
+        out = {
+            "origin": str(route["origin"]).upper(),
+            "destination": str(route["destination"]).upper(),
+            "departure_date": route["departure_date"],
+        }
+        if route.get("return_date"):
+            out["return_date"] = route["return_date"]
     if route.get("adults") not in (None, ""):
         out["adults"] = int(route["adults"])
+    if route.get("teens") not in (None, ""):
+        out["teens"] = int(route["teens"])
+    if route.get("max_duration_hours") not in (None, ""):
+        out["max_duration_hours"] = float(route["max_duration_hours"])
     if "non_stop" in route:
         out["non_stop"] = bool(route["non_stop"])
     if route.get("travel_class"):
@@ -308,7 +350,18 @@ def api_routes_save():
 
 
 def route_label(route: dict) -> str:
-    """Same label flight_monitor.py uses for state.json keys."""
+    """Same label flight_monitor.py uses for state.json keys.
+
+    Simple route: "ORIGIN-DEST DATE". Multi-leg (legs) route: the airport
+    chain joined by "-" (first leg's origin, then every leg's destination in
+    order) plus the first leg's date, e.g. "JFK-HEL-BER-JFK 2026-09-15".
+    """
+    legs = route.get("legs")
+    if isinstance(legs, list) and legs:
+        chain = [str((legs[0] or {}).get("origin", "?"))] + [
+            str((leg or {}).get("destination", "?")) for leg in legs
+        ]
+        return f"{'-'.join(chain)} {(legs[0] or {}).get('date', '?')}"
     return f"{route.get('origin', '?')}-{route.get('destination', '?')} {route.get('departure_date', '?')}"
 
 

@@ -118,6 +118,45 @@ class TestValidateRoutes:
         }])
         assert any("travel_class must be one of" in e for e in errors)
 
+    def test_valid_teens(self):
+        routes = [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15", "teens": 2}]
+        assert webapp.validate_routes(routes) == []
+
+    def test_zero_teens_is_valid(self):
+        routes = [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15", "teens": 0}]
+        assert webapp.validate_routes(routes) == []
+
+    def test_negative_teens(self):
+        errors = webapp.validate_routes([{
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15", "teens": -1,
+        }])
+        assert any("teens must be a non-negative integer" in e for e in errors)
+
+    def test_non_numeric_teens(self):
+        errors = webapp.validate_routes([{
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15", "teens": "two",
+        }])
+        assert any("teens must be a non-negative integer" in e for e in errors)
+
+    def test_valid_max_duration_hours(self):
+        routes = [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+                   "max_duration_hours": 24}]
+        assert webapp.validate_routes(routes) == []
+
+    def test_zero_max_duration_hours_invalid(self):
+        errors = webapp.validate_routes([{
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+            "max_duration_hours": 0,
+        }])
+        assert any("max_duration_hours must be a positive number" in e for e in errors)
+
+    def test_negative_max_duration_hours(self):
+        errors = webapp.validate_routes([{
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+            "max_duration_hours": -5,
+        }])
+        assert any("max_duration_hours must be a positive number" in e for e in errors)
+
     def test_valid_run_times(self):
         routes = [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
                    "run_times": ["7:30", "19:30"]}]
@@ -144,6 +183,37 @@ class TestValidateRoutes:
         ])
         assert errors and all(e.startswith("Route 2") for e in errors)
 
+    def test_valid_legs_route(self):
+        routes = [{"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ]}]
+        assert webapp.validate_routes(routes) == []
+
+    def test_legs_route_not_flagged_for_missing_simple_fields(self):
+        # A legs route has no origin/destination/departure_date of its own —
+        # those checks must not fire for it.
+        routes = [{"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+        ]}]
+        errors = webapp.validate_routes(routes)
+        assert not any("origin" in e or "destination" in e or "departure_date" in e for e in errors)
+
+    def test_legs_route_needs_at_least_two_legs(self):
+        errors = webapp.validate_routes(
+            [{"legs": [{"origin": "JFK", "destination": "HEL", "date": "2026-09-15"}]}]
+        )
+        assert any("at least 2 legs" in e for e in errors)
+
+    def test_legs_route_missing_leg_field(self):
+        errors = webapp.validate_routes([{"legs": [
+            {"origin": "JFK", "destination": "HEL"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+        ]}])
+        assert any("missing required field" in e for e in errors)
+
 
 class TestNormalizeRoute:
     def test_uppercases_iata_codes(self):
@@ -154,6 +224,29 @@ class TestNormalizeRoute:
     def test_omits_absent_optional_fields(self):
         out = webapp.normalize_route({"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15"})
         assert set(out) == {"origin", "destination", "departure_date"}
+
+    def test_teens_coerced_to_int(self):
+        out = webapp.normalize_route({
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15", "teens": "2",
+        })
+        assert out["teens"] == 2
+
+    def test_zero_teens_included(self):
+        out = webapp.normalize_route({
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15", "teens": 0,
+        })
+        assert out["teens"] == 0
+
+    def test_max_duration_hours_coerced_to_float(self):
+        out = webapp.normalize_route({
+            "origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+            "max_duration_hours": "24",
+        })
+        assert out["max_duration_hours"] == 24.0
+
+    def test_max_duration_hours_omitted_when_absent(self):
+        out = webapp.normalize_route({"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15"})
+        assert "max_duration_hours" not in out
 
     def test_includes_return_date_when_present(self):
         out = webapp.normalize_route({
@@ -190,6 +283,29 @@ class TestNormalizeRoute:
         })
         assert out["adults"] == 2
 
+    def test_legs_passed_through_verbatim(self):
+        legs = [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ]
+        out = webapp.normalize_route({"legs": legs})
+        assert out["legs"] == legs
+        assert "origin" not in out
+        assert "departure_date" not in out
+
+    def test_legs_route_still_gets_shared_optional_fields(self):
+        out = webapp.normalize_route({
+            "legs": [
+                {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+                {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            ],
+            "adults": "3",
+            "run_times": ["19:30", "7:30"],
+        })
+        assert out["adults"] == 3
+        assert out["run_times"] == ["07:30", "19:30"]
+
 
 # ---------------------------------------------------------------------------
 # /api/routes
@@ -222,6 +338,20 @@ class TestApiRoutes:
         assert resp.status_code == 200
         saved = json.loads(routes_file.read_text())
         assert saved == [{"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15"}]
+
+    def test_post_legs_route_round_trips_unchanged(self, client, routes_file):
+        # No editor UI builds these yet, but POST /api/routes (used e.g. by the
+        # /routes page's Save action) must not corrupt a hand-added multi-leg
+        # route saved for an unrelated reason.
+        legs = [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ]
+        resp = client.post("/api/routes", json=[{"legs": legs}])
+        assert resp.status_code == 200
+        saved = json.loads(routes_file.read_text())
+        assert saved == [{"legs": legs}]
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +605,22 @@ class TestSchedulePlan:
              "run_times": ["05:00", "13:30", "23:00"]},
         ]))
         assert webapp.schedule_plan()["outside_active_hours"] == ["05:00", "23:00"]
+
+    def test_legs_route_gets_a_distinct_correct_label(self, routes_file):
+        routes_file.write_text(json.dumps([
+            {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
+             "run_times": ["07:30"]},
+            {"legs": [
+                {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+                {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+                {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+             ], "run_times": ["07:30"]},
+        ]))
+        plan = webapp.schedule_plan()
+        labels = plan["by_time"]["07:30"]
+        assert "YVR-FRA 2027-03-15" in labels
+        assert "JFK-HEL-BER-JFK 2026-09-15" in labels
+        assert "?-? ?" not in labels
 
 
 class TestApiSchedule:

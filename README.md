@@ -41,7 +41,27 @@ cp routes.example.json routes.json
 ]
 ```
 
-Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`), `run_times` (the local clock times this route is checked at, e.g. `["07:30", "19:30"]` — see `routes.example.json` for a working example).
+Fields: `origin` and `destination` are IATA airport codes. `departure_date` is required. Optional fields: `return_date` (one-way if omitted), `adults` (default 1), `teens` (default 0 — see below), `non_stop` (default `true`), `travel_class` (`ECONOMY`, `PREMIUM_ECONOMY`, `BUSINESS`, or `FIRST` — default `ECONOMY`), `max_duration_hours` (drop itineraries longer than this — see below), `run_times` (the local clock times this route is checked at, e.g. `["07:30", "19:30"]` — see `routes.example.json` for a working example).
+
+**Teens (12-17)**: Google Flights/SerpAPI have no distinct fare tier for that age band — only Adults, Children (2-11), and Infants — so a 12-17 year old flies on an adult fare. Set `teens` alongside `adults` (e.g. `"adults": 2, "teens": 2` for two adults + two teens) and the monitor sends `adults + teens` to SerpAPI; `teens` is tracked separately purely so Telegram alerts read "2 adults + 2 teens" instead of just "4 pax".
+
+**Max duration**: set `max_duration_hours` (e.g. `24`) to have SerpAPI drop itineraries longer than that — no default cap, opt in per route. Values are hours in `routes.json`/the editor; the monitor converts to the minutes SerpAPI's `max_duration` param expects.
+
+**Multi-leg (multi-city) trips** — three or more stops on different dates, e.g. JFK → HEL, HEL → BER, BER → JFK — use a `legs` array instead of `origin`/`destination`/`departure_date`/`return_date`:
+
+```json
+{
+  "legs": [
+    {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+    {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+    {"origin": "BER", "destination": "JFK", "date": "2026-09-25"}
+  ],
+  "adults": 1,
+  "run_times": ["07:30"]
+}
+```
+
+`adults`/`teens`/`non_stop`/`travel_class`/`max_duration_hours`/`run_times` all still apply. This still costs one SerpAPI search per check, same as any other route. Build one from the `/routes` editor's "+ Add multi-leg route" button, or by hand-editing `routes.json`.
 
 **Routes decide when the monitor runs.** The crontab is the union of every route's `run_times`, so adding a time to a route adds a firing and removing the last route that used a time removes it. A route with no `run_times` is checked at *every* firing the other routes schedule. The dashboard's Schedule page shows that union — which routes fire at each time and what it costs in searches — and installs it (see "Schedule" below). The older `run_hours` field (a list of hours that could only *filter* firings the crontab already had, never create one) still works: the Schedule page maps those hours onto real times — reusing the published firing's minutes where there is one — so publishing before you migrate keeps the route running, and the routes editor converts the field to `run_times` when you save.
 
@@ -226,6 +246,7 @@ Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*.
 | `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
 | `RETENTION_DAYS` | No | `30` | Prune history and archived responses older than this (each run) |
 | `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that connect through a US airport (nonstop and non-US connections kept) |
+| `MULTI_CITY_DEEP_SEARCH` | No | `false` | Adds `deep_search=true` to multi-leg (`legs`) route searches only — extra cost/latency, sometimes needed to match Google Flights' website for multi-city itineraries |
 | `FLASK_DEBUG` | No | `false` | Enable Flask debug mode for the dashboard (`app.py`) — local development only |
 
 ## SerpAPI account sync & quota alerts

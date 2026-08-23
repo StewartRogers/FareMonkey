@@ -106,6 +106,74 @@ class TestLoadRoutes:
             with pytest.raises(SystemExit):
                 fm.load_routes()
 
+    def test_valid_legs_route(self, tmp_path):
+        path = tmp_path / "routes.json"
+        routes = [{"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ]}]
+        path.write_text(json.dumps(routes), encoding="utf-8")
+        with mock.patch.object(fm, "ROUTES_FILE", path):
+            assert fm.load_routes() == routes
+
+    def test_legs_route_missing_leg_field_exits(self, tmp_path):
+        path = tmp_path / "routes.json"
+        routes = [{"legs": [
+            {"origin": "JFK", "destination": "HEL"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+        ]}]
+        path.write_text(json.dumps(routes), encoding="utf-8")
+        with mock.patch.object(fm, "ROUTES_FILE", path):
+            with pytest.raises(SystemExit):
+                fm.load_routes()
+
+    def test_legs_route_needs_at_least_two_legs(self, tmp_path):
+        path = tmp_path / "routes.json"
+        routes = [{"legs": [{"origin": "JFK", "destination": "HEL", "date": "2026-09-15"}]}]
+        path.write_text(json.dumps(routes), encoding="utf-8")
+        with mock.patch.object(fm, "ROUTES_FILE", path):
+            with pytest.raises(SystemExit):
+                fm.load_routes()
+
+    def test_legs_combined_with_simple_fields_exits(self, tmp_path):
+        path = tmp_path / "routes.json"
+        routes = [{
+            "origin": "JFK", "destination": "HEL", "departure_date": "2026-09-15",
+            "legs": [
+                {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+                {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            ],
+        }]
+        path.write_text(json.dumps(routes), encoding="utf-8")
+        with mock.patch.object(fm, "ROUTES_FILE", path):
+            with pytest.raises(SystemExit):
+                fm.load_routes()
+
+
+# ---------------------------------------------------------------------------
+# route_label
+# ---------------------------------------------------------------------------
+
+class TestRouteLabel:
+    def test_simple_route(self):
+        route = {"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"}
+        assert fm.route_label(route) == "YVR-CUN 2026-12-23"
+
+    def test_legs_route(self):
+        route = {"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ]}
+        assert fm.route_label(route) == "JFK-HEL-BER-JFK 2026-09-15"
+
+    def test_empty_legs_does_not_raise(self):
+        assert fm.route_label({"legs": []}) == "? ?"
+
+    def test_missing_fields_degrade_gracefully(self):
+        assert fm.route_label({}) == "?-? ?"
+
 
 # ---------------------------------------------------------------------------
 # Helpers: time / scheduling
@@ -607,6 +675,46 @@ class TestFormatTelegram:
         assert "Outbound" not in msg
         assert "Inbound: Dec 30" in msg
 
+    LEGS_ROUTE = {
+        "legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ],
+        "adults": 1,
+    }
+
+    def test_legs_header_lists_full_chain(self):
+        msg = fm.format_telegram(self.LEGS_ROUTE, self.OFFER, "🐒", None)
+        lines = msg.split("\n")
+        assert lines[0] == "🐒 JFK → HEL → BER → JFK (1 pax)"
+
+    def test_legs_lists_each_leg(self):
+        msg = fm.format_telegram(self.LEGS_ROUTE, self.OFFER, "🐒", None)
+        assert "Leg 1: JFK → HEL | Sep 15" in msg
+        assert "Leg 2: HEL → BER | Sep 20" in msg
+        assert "Leg 3: BER → JFK | Sep 25" in msg
+
+    def test_legs_no_outbound_inbound_wording(self):
+        msg = fm.format_telegram(self.LEGS_ROUTE, self.OFFER, "🐒", None)
+        assert "Outbound" not in msg
+        assert "Inbound" not in msg
+
+    def test_teens_shown_in_header(self):
+        route = {**self.ROUTE, "adults": 2, "teens": 2}
+        msg = fm.format_telegram(route, self.OFFER, "✈️", -1.0)
+        assert "(2 adults + 2 teens)" in msg.split("\n")[0]
+
+    def test_singular_adult_and_teen(self):
+        route = {**self.ROUTE, "adults": 1, "teens": 1}
+        msg = fm.format_telegram(route, self.OFFER, "✈️", -1.0)
+        assert "(1 adult + 1 teen)" in msg.split("\n")[0]
+
+    def test_no_teens_still_shows_pax(self):
+        # self.ROUTE has no "teens" key at all — must not crash or change format.
+        msg = fm.format_telegram(self.ROUTE, self.OFFER, "✈️", -1.0)
+        assert "(4 pax)" in msg.split("\n")[0]
+
 
 # ---------------------------------------------------------------------------
 # Archive / trim
@@ -616,7 +724,7 @@ class TestArchiveResponse:
     def test_writes_jsonl(self, responses_file):
         with mock.patch.object(fm, "ARCHIVE_RESPONSES", True):
             fm.archive_response(
-                {"origin": "YVR", "destination": "CUN"},
+                {"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"},
                 {"api_key": "SECRET", "departure_id": "YVR"},
                 {"best_flights": []},
             )
@@ -624,7 +732,18 @@ class TestArchiveResponse:
         assert len(lines) == 1
         record = json.loads(lines[0])
         assert "api_key" not in record["query"]
-        assert record["route"] == "YVR-CUN"
+        assert record["route"] == "YVR-CUN 2026-12-23"
+
+    def test_writes_jsonl_legs_route(self, responses_file):
+        route = {"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+        ]}
+        with mock.patch.object(fm, "ARCHIVE_RESPONSES", True):
+            fm.archive_response(route, {"api_key": "SECRET"}, {"best_flights": []})
+        lines = responses_file.read_text(encoding="utf-8").strip().split("\n")
+        record = json.loads(lines[0])
+        assert record["route"] == "JFK-HEL-BER 2026-09-15"
 
     def test_disabled(self, responses_file):
         with mock.patch.object(fm, "ARCHIVE_RESPONSES", False):
@@ -947,6 +1066,110 @@ class TestSearchCheapest:
         assert "return_date" not in call_params
         assert offer["price"] == 2000.0
 
+    LEGS_ROUTE = {
+        "legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ],
+        "adults": 2, "non_stop": False, "travel_class": "BUSINESS",
+    }
+
+    def test_legs_route_params(self):
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.LEGS_ROUTE)
+        call_params = mock_get.call_args[1]["params"]
+        assert call_params["type"] == 3
+        legs_sent = json.loads(call_params["multi_city_json"])
+        assert legs_sent == [
+            {"departure_id": "JFK", "arrival_id": "HEL", "date": "2026-09-15"},
+            {"departure_id": "HEL", "arrival_id": "BER", "date": "2026-09-20"},
+            {"departure_id": "BER", "arrival_id": "JFK", "date": "2026-09-25"},
+        ]
+        for key in ("departure_id", "arrival_id", "outbound_date", "return_date"):
+            assert key not in call_params
+        assert offer["price"] == 4000.0
+
+    def test_legs_route_deep_search_off_by_default(self):
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False), \
+             mock.patch.object(fm, "MULTI_CITY_DEEP_SEARCH", False):
+            fm.search_cheapest(self.LEGS_ROUTE)
+        call_params = mock_get.call_args[1]["params"]
+        assert "deep_search" not in call_params
+
+    def test_legs_route_deep_search_enabled(self):
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False), \
+             mock.patch.object(fm, "MULTI_CITY_DEEP_SEARCH", True):
+            fm.search_cheapest(self.LEGS_ROUTE)
+        call_params = mock_get.call_args[1]["params"]
+        assert call_params["deep_search"] == "true"
+
+    def test_legs_route_keeps_multi_stop_candidates(self):
+        # Unlike simple routes, legs routes don't cap total layovers at 1 — a
+        # legitimate 3-leg itinerary can have one connection per leg, which
+        # would look like "many stops" in aggregate even though each leg is
+        # individually fine.
+        many_stops = self._flight(3000, layovers=[{"id": "GDL"}, {"id": "MEX"}, {"id": "ORD"}])
+        resp = self._make_response(best=[many_stops])
+        with mock.patch("requests.get", return_value=resp), \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            offer = fm.search_cheapest(self.LEGS_ROUTE)
+        assert offer is not None
+        assert offer["price"] == 3000.0
+
+    def test_teens_folded_into_adults_param(self):
+        route = {**self.ROUTE, "adults": 2, "teens": 2}
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(route)
+        assert mock_get.call_args[1]["params"]["adults"] == 4
+
+    def test_no_teens_leaves_adults_unchanged(self):
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(self.ROUTE)
+        assert mock_get.call_args[1]["params"]["adults"] == self.ROUTE["adults"]
+
+    def test_max_duration_hours_converted_to_minutes(self):
+        route = {**self.ROUTE, "max_duration_hours": 24}
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(route)
+        assert mock_get.call_args[1]["params"]["max_duration"] == 1440
+
+    def test_max_duration_hours_rounds_fractional(self):
+        route = {**self.ROUTE, "max_duration_hours": 1.5}
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(route)
+        assert mock_get.call_args[1]["params"]["max_duration"] == 90
+
+    def test_no_max_duration_param_when_absent(self):
+        resp = self._make_response(best=[self._flight(4000)])
+        with mock.patch("requests.get", return_value=resp) as mock_get, \
+             mock.patch.object(fm, "ARCHIVE_RESPONSES", False), \
+             mock.patch.object(fm, "EXCLUDE_US_CONNECTIONS", False):
+            fm.search_cheapest(self.ROUTE)
+        assert "max_duration" not in mock_get.call_args[1]["params"]
+
 
 # ---------------------------------------------------------------------------
 # Telegram
@@ -1014,3 +1237,63 @@ class TestMaybeAlertQuota:
             fm._maybe_alert_quota("A", 429, "")
             fm._maybe_alert_quota("B", 429, "")
         assert mock_tg.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# run_scan (mocked search_cheapest)
+# ---------------------------------------------------------------------------
+
+class TestRunScan:
+    LEGS_ROUTE = {
+        "legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "BER", "date": "2026-09-20"},
+            {"origin": "BER", "destination": "JFK", "date": "2026-09-25"},
+        ],
+        "adults": 1,
+    }
+    SIMPLE_ROUTE = {
+        "origin": "YVR", "destination": "CUN",
+        "departure_date": "2026-12-23", "return_date": "2026-12-30",
+    }
+
+    def _run(self, route, days, state_file):
+        probes = []
+
+        def fake_search(r):
+            probes.append(r)
+            return {"price": 1000.0}
+
+        with mock.patch.object(fm, "load_routes", return_value=[route]), \
+             mock.patch.object(fm, "sync_account_quota"), \
+             mock.patch.object(fm, "can_make_calls", return_value=True), \
+             mock.patch.object(fm, "search_cheapest", side_effect=fake_search), \
+             mock.patch.object(fm, "send_telegram"):
+            fm.run_scan(days)
+        return probes, fm.load_json(state_file)
+
+    def test_legs_route_shifts_every_leg_by_same_offset(self, state_file):
+        probes, state = self._run(self.LEGS_ROUTE, 1, state_file)
+
+        assert len(probes) == 3  # offsets -1, 0, +1
+        shifted_back = next(p for p in probes if p["legs"][0]["date"] == "2026-09-14")
+        assert [leg["date"] for leg in shifted_back["legs"]] == [
+            "2026-09-14", "2026-09-19", "2026-09-24",
+        ]
+        shifted_fwd = next(p for p in probes if p["legs"][0]["date"] == "2026-09-16")
+        assert [leg["date"] for leg in shifted_fwd["legs"]] == [
+            "2026-09-16", "2026-09-21", "2026-09-26",
+        ]
+
+        label = fm.route_label(self.LEGS_ROUTE)
+        assert state["flex_scans"][label]["base_date"] == "2026-09-15"
+
+    def test_simple_route_shifts_departure_and_return_together(self, state_file):
+        probes, state = self._run(self.SIMPLE_ROUTE, 1, state_file)
+
+        assert len(probes) == 3
+        shifted_back = next(p for p in probes if p["departure_date"] == "2026-12-22")
+        assert shifted_back["return_date"] == "2026-12-29"
+
+        label = fm.route_label(self.SIMPLE_ROUTE)
+        assert state["flex_scans"][label]["base_date"] == "2026-12-23"
