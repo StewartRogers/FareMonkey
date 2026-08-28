@@ -933,11 +933,13 @@ def format_telegram(route: dict, offer: dict, icon: str,
                 times = f"{dep_raw[11:]} → {arr_raw[11:]}{plus}"
             else:
                 times = "flight times not available"
+            leg_dur = leg.get("total_duration")
+            dur_part = f" | {leg_dur // 60}h {leg_dur % 60:02d}m" if leg_dur else ""
             leg_price = leg.get("price")
             price_part = f" | {CURRENCY} {_format_price(leg_price)}" if leg_price is not None else ""
             leg_lines.append(
                 f"Leg {i + 1}: {leg.get('origin', '?')} → {leg.get('destination', '?')} | "
-                f"{date_str} | {times}{price_part}"
+                f"{date_str} | {times}{dur_part}{price_part}"
             )
         return "\n".join([header, summary, ""] + leg_lines)
 
@@ -1295,6 +1297,15 @@ def main() -> None:
             continue
 
     state["last_run"] = now_str
+
+    # sync_and_persist_account_quota() (above) persisted this_month_usage as of
+    # process start, before any of this run's own searches. Refresh it here with
+    # those searches folded in (current_usage(), no extra API call) so the
+    # dashboard reflects them immediately instead of only after the next run's
+    # sync — reusing the state dict already headed for the save below rather
+    # than another separate read/write of state.json.
+    if _calls_made_this_run and current_usage() is not None and "account_usage" in state:
+        state["account_usage"]["this_month_usage"] = current_usage()
 
     # Keep the dataset bounded: prune history, archived responses, and log lines
     # past the retention window every run so local files don't grow forever.
