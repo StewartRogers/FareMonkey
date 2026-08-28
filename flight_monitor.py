@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import sys
@@ -55,6 +57,9 @@ RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "30"))
 
 SERPAPI_BASE = "https://serpapi.com/search"
 STATE_FILE = Path(__file__).parent / "state.json"
+# Advisory-lock file guarding state.json's read-modify-write cycle across
+# flight_monitor.py and app.py — see state_lock().
+STATE_LOCK_FILE = Path(__file__).parent / "state.json.lock"
 ROUTES_FILE = Path(__file__).parent / "routes.json"
 # Append-only archive of every raw API response (kept out of state.json so the
 # dashboard, which parses state.json on every request, stays fast).
@@ -130,6 +135,27 @@ def save_json(path: Path, data: dict) -> None:
     except BaseException:
         os.unlink(tmp)
         raise
+
+
+@contextlib.contextmanager
+def state_lock():
+    """Cross-process advisory lock guarding a state.json read-modify-write cycle.
+
+    flight_monitor.py (cron/--scan/--trim) and app.py's DELETE /api/routes/<label>
+    each load state.json, mutate an in-memory copy, then save — with no
+    coordination, a save from one process can silently clobber a change the
+    other made in between (e.g. a route deleted from the dashboard mid-run
+    reappearing because the monitor's stale in-memory copy still has it).
+    Held for the whole load-mutate-save span, not just the save, so a
+    concurrent writer waits its turn instead of racing. Advisory + POSIX-only
+    (fcntl.flock) — fine here since this only ever runs on Linux.
+    """
+    with open(STATE_LOCK_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
@@ -392,13 +418,14 @@ def sync_and_persist_account_quota() -> int | None:
     """
     left = sync_account_quota()
     if _this_month_usage is not None:
-        state = load_json(STATE_FILE)
-        state["account_usage"] = {
-            "this_month_usage": _this_month_usage,
-            "searches_left": _searches_left,
-            "synced": current_local_time().isoformat(),
-        }
-        save_json(STATE_FILE, state)
+        with state_lock():
+            state = load_json(STATE_FILE)
+            state["account_usage"] = {
+                "this_month_usage": _this_month_usage,
+                "searches_left": _searches_left,
+                "synced": current_local_time().isoformat(),
+            }
+            save_json(STATE_FILE, state)
     return left
 
 
@@ -429,14 +456,14 @@ def _has_us_layover(flight: dict) -> bool:
     """
     return any(
         (lo.get("id") or "").upper() in US_HUBS
-        for lo in flight.get("layovers", [])
+        for lo in flight.get("layovers") or []
     )
 
 
 def _dedup_airlines(flight: dict) -> list[str]:
     """Ordered, deduplicated list of airline names across a flight's segments."""
     airlines: list[str] = []
-    for seg in flight.get("flights", []):
+    for seg in flight.get("flights") or []:
         airline = seg.get("airline")
         if airline and airline not in airlines:
             airlines.append(airline)
@@ -445,15 +472,15 @@ def _dedup_airlines(flight: dict) -> list[str]:
 
 def _extract_details(flight: dict) -> dict:
     """Pull human-readable details from a SerpAPI flight option."""
-    segments = flight.get("flights", [])
-    layovers = flight.get("layovers", [])
+    segments = flight.get("flights") or []
+    layovers = flight.get("layovers") or []
     airlines = _dedup_airlines(flight)
     flight_numbers: list[str] = []
     for seg in segments:
         if seg.get("flight_number"):
             flight_numbers.append(seg["flight_number"])
-    dep = segments[0].get("departure_airport", {}) if segments else {}
-    arr = segments[-1].get("arrival_airport", {}) if segments else {}
+    dep = (segments[0].get("departure_airport") or {}) if segments else {}
+    arr = (segments[-1].get("arrival_airport") or {}) if segments else {}
     return {
         "airlines": airlines,
         "flight_numbers": flight_numbers,
@@ -470,7 +497,7 @@ def _summarize(flight: dict) -> dict:
     return {
         "price": float(flight["price"]),
         "airlines": _dedup_airlines(flight),
-        "stops": len(flight.get("layovers", [])),
+        "stops": len(flight.get("layovers") or []),
         "total_duration": flight.get("total_duration"),
     }
 
@@ -629,7 +656,7 @@ def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
         _QUOTA_ALERTED = True
         send_telegram(
             "🚨 *FareMonkey: SerpAPI searches exhausted*\n"
-            f"Could not check *{label}* — your SerpAPI plan appears to be out of "
+            f"Could not check *{_esc_md(label)}* — your SerpAPI plan appears to be out of "
             f"searches.\n`{(message or '').strip()[:300]}`"
         )
     return True
@@ -779,7 +806,7 @@ def search_cheapest(route: dict) -> dict | None:
     candidates = [
         flight
         for key in ("best_flights", "other_flights")
-        for flight in data.get(key, [])
+        for flight in data.get(key) or []
         if flight.get("price") is not None
     ]
     if not candidates:
@@ -800,7 +827,7 @@ def search_cheapest(route: dict) -> dict | None:
     # for every call this function makes, including each leg of a multi-leg
     # route (via _search_multi_leg), so multi-leg itineraries get the same
     # per-leg stop cap as any other route.
-    kept = [f for f in candidates if len(f.get("layovers", [])) <= 1]
+    kept = [f for f in candidates if len(f.get("layovers") or []) <= 1]
     dropped = len(candidates) - len(kept)
     if dropped:
         log(f"  Excluded {dropped} itinerary(ies) with 2+ stops.")
@@ -872,6 +899,21 @@ def format_offer(offer: dict) -> str:
     return " · ".join(parts)
 
 
+def _esc_md(text) -> str:
+    """Escape Telegram legacy-Markdown special characters in user-controlled text.
+
+    routes.json (including multi-leg `legs` fields) is validated loosely and
+    is reachable via the unauthenticated LAN /api/routes endpoint (see
+    CLAUDE.md), so a crafted origin/destination/label could otherwise inject
+    Markdown formatting — or a clickable link via `[text](url)` — into an
+    alert that looks like a routine FareMonkey price update.
+    """
+    s = str(text)
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
 def format_telegram(route: dict, offer: dict, icon: str,
                     pct_change: float | None) -> str:
     """Build the full Telegram alert message for a route check."""
@@ -888,12 +930,12 @@ def format_telegram(route: dict, offer: dict, icon: str,
     if is_legs:
         legs = route.get("legs") or []
         chain = " → ".join(
-            [str((legs[0] or {}).get("origin", "?"))]
-            + [str((leg or {}).get("destination", "?")) for leg in legs]
+            [_esc_md((legs[0] or {}).get("origin", "?"))]
+            + [_esc_md((leg or {}).get("destination", "?")) for leg in legs]
         )
         header = f"{icon} {chain} ({pax})"
     else:
-        header = f"{icon} {route['origin']} → {route['destination']} ({pax})"
+        header = f"{icon} {_esc_md(route['origin'])} → {_esc_md(route['destination'])} ({pax})"
 
     # Price + change + flight summary — all on one line
     price_str = f"{CURRENCY} {_format_price(price)}"
@@ -938,7 +980,7 @@ def format_telegram(route: dict, offer: dict, icon: str,
             leg_price = leg.get("price")
             price_part = f" | {CURRENCY} {_format_price(leg_price)}" if leg_price is not None else ""
             leg_lines.append(
-                f"Leg {i + 1}: {leg.get('origin', '?')} → {leg.get('destination', '?')} | "
+                f"Leg {i + 1}: {_esc_md(leg.get('origin', '?'))} → {_esc_md(leg.get('destination', '?'))} | "
                 f"{date_str} | {times}{dur_part}{price_part}"
             )
         return "\n".join([header, summary, ""] + leg_lines)
@@ -1023,121 +1065,130 @@ def run_scan(days: int) -> None:
     sync_and_persist_account_quota()
     routes = load_routes()
 
-    state = load_json(STATE_FILE)
-    offsets = list(range(-days, days + 1))
-    needed = sum(route_search_cost(r) for r in routes) * len(offsets)
-    if not can_make_calls(needed):
-        usage = current_usage()
-        if usage is None:
-            sys.exit(
-                "Could not verify real SerpAPI usage (account sync failed). "
-                "Refusing to scan without a reliable usage count."
-            )
-        sys.exit(
-            f"Monthly cap would be exceeded ({usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used). "
-            f"A {len(offsets)}-day scan of {len(routes)} route(s) needs {needed} searches. "
-            f"Lower --days or wait for the next month."
-        )
-
-    flex = state.setdefault("flex_scans", {})
-    now_str = current_local_time().isoformat()
-    log(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
-
-    for route in routes:
-        is_legs = _is_legs_route(route)
-        if is_legs:
-            legs = route.get("legs") or []
-            anchor = datetime.strptime(legs[0]["date"], "%Y-%m-%d").date()
-        else:
-            base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
-            base_ret = (
-                datetime.strptime(route["return_date"], "%Y-%m-%d").date()
-                if route.get("return_date")
-                else None
-            )
-            anchor = base_dep
-        # Match the price-history key format ("ORIGIN-DEST DATE") so multiple
-        # routes sharing an origin/destination but differing by date don't
-        # collide and overwrite each other in flex_scans.
-        label = route_label(route)
-        log(f"Scanning {label} ...")
-
-        results: list[dict] = []
-        for off in offsets:
-            probe = dict(route)
-            if is_legs:
-                # Shift every leg's date by the same offset, preserving the
-                # gaps between legs — the multi-leg equivalent of shifting
-                # return_date alongside departure_date for a round trip.
-                probe["legs"] = [
-                    {
-                        **leg,
-                        "date": (
-                            datetime.strptime(leg["date"], "%Y-%m-%d").date()
-                            + timedelta(days=off)
-                        ).isoformat(),
-                    }
-                    for leg in legs
-                ]
-                date_key = probe["legs"][0]["date"]
-            else:
-                dep = base_dep + timedelta(days=off)
-                probe["departure_date"] = dep.isoformat()
-                if base_ret is not None:
-                    probe["return_date"] = (base_ret + timedelta(days=off)).isoformat()
-                date_key = dep.isoformat()
-
-            try:
-                offer = search_cheapest(probe)
-                increment_call_count(state, route_search_cost(probe))
-                price = offer["price"] if offer else None
-            except Exception as e:
-                increment_call_count(state, route_search_cost(probe))
-                log(f"  {date_key}: error ({e}){log_searches_left()}")
-                results.append(
-                    {"date": date_key, "return_date": probe.get("return_date"), "price": None}
+    with state_lock():
+        state = load_json(STATE_FILE)
+        offsets = list(range(-days, days + 1))
+        needed = sum(route_search_cost(r) for r in routes) * len(offsets)
+        if not can_make_calls(needed):
+            usage = current_usage()
+            if usage is None:
+                sys.exit(
+                    "Could not verify real SerpAPI usage (account sync failed). "
+                    "Refusing to scan without a reliable usage count."
                 )
+            sys.exit(
+                f"Monthly cap would be exceeded ({usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used). "
+                f"A {len(offsets)}-day scan of {len(routes)} route(s) needs {needed} searches. "
+                f"Lower --days or wait for the next month."
+            )
+
+        flex = state.setdefault("flex_scans", {})
+        now_str = current_local_time().isoformat()
+        log(f"Flexible-date scan: ±{days} days ({needed} searches)\n")
+
+        for route in routes:
+            is_legs = _is_legs_route(route)
+            # load_routes() only checks that date fields are present, not that
+            # they parse as dates, so a hand-edited routes.json can reach here
+            # with a malformed date — isolate that per route, like main() does
+            # for the rest of the per-route body, instead of killing the whole scan.
+            try:
+                if is_legs:
+                    legs = route.get("legs") or []
+                    anchor = datetime.strptime(legs[0]["date"], "%Y-%m-%d").date()
+                else:
+                    base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
+                    base_ret = (
+                        datetime.strptime(route["return_date"], "%Y-%m-%d").date()
+                        if route.get("return_date")
+                        else None
+                    )
+                    anchor = base_dep
+            except (ValueError, TypeError, KeyError) as e:
+                log(f"Skipping {route_label(route)}: invalid date ({e})")
                 continue
-            results.append(
-                {
-                    "date": date_key,
-                    "return_date": probe.get("return_date"),
-                    "price": price,
-                }
-            )
-            marker = "  ← base" if off == 0 else ""
-            price_str = f"{CURRENCY} {price:.2f}" if price is not None else "no offers"
-            log(f"  {date_key}: {price_str}{marker}{log_searches_left()}")
+            # Match the price-history key format ("ORIGIN-DEST DATE") so multiple
+            # routes sharing an origin/destination but differing by date don't
+            # collide and overwrite each other in flex_scans.
+            label = route_label(route)
+            log(f"Scanning {label} ...")
 
-        priced = [r for r in results if r["price"] is not None]
-        cheapest = min(priced, key=lambda r: r["price"]) if priced else None
-        base = next((r for r in results if r["date"] == anchor.isoformat()), None)
-        flex[label] = {
-            "scanned": now_str,
-            "base_date": anchor.isoformat(),
-            "days": days,
-            "results": results,
-            "cheapest": cheapest,
-        }
-        # Save after each route so results already paid for survive a crash
-        # or unhandled error partway through a multi-route scan.
+            results: list[dict] = []
+            for off in offsets:
+                probe = dict(route)
+                if is_legs:
+                    # Shift every leg's date by the same offset, preserving the
+                    # gaps between legs — the multi-leg equivalent of shifting
+                    # return_date alongside departure_date for a round trip.
+                    probe["legs"] = [
+                        {
+                            **leg,
+                            "date": (
+                                datetime.strptime(leg["date"], "%Y-%m-%d").date()
+                                + timedelta(days=off)
+                            ).isoformat(),
+                        }
+                        for leg in legs
+                    ]
+                    date_key = probe["legs"][0]["date"]
+                else:
+                    dep = base_dep + timedelta(days=off)
+                    probe["departure_date"] = dep.isoformat()
+                    if base_ret is not None:
+                        probe["return_date"] = (base_ret + timedelta(days=off)).isoformat()
+                    date_key = dep.isoformat()
+
+                try:
+                    offer = search_cheapest(probe)
+                    increment_call_count(state, route_search_cost(probe))
+                    price = offer["price"] if offer else None
+                except Exception as e:
+                    increment_call_count(state, route_search_cost(probe))
+                    log(f"  {date_key}: error ({e}){log_searches_left()}")
+                    results.append(
+                        {"date": date_key, "return_date": probe.get("return_date"), "price": None}
+                    )
+                    continue
+                results.append(
+                    {
+                        "date": date_key,
+                        "return_date": probe.get("return_date"),
+                        "price": price,
+                    }
+                )
+                marker = "  ← base" if off == 0 else ""
+                price_str = f"{CURRENCY} {price:.2f}" if price is not None else "no offers"
+                log(f"  {date_key}: {price_str}{marker}{log_searches_left()}")
+
+            priced = [r for r in results if r["price"] is not None]
+            cheapest = min(priced, key=lambda r: r["price"]) if priced else None
+            base = next((r for r in results if r["date"] == anchor.isoformat()), None)
+            flex[label] = {
+                "scanned": now_str,
+                "base_date": anchor.isoformat(),
+                "days": days,
+                "results": results,
+                "cheapest": cheapest,
+            }
+            # Save after each route so results already paid for survive a crash
+            # or unhandled error partway through a multi-route scan.
+            save_json(STATE_FILE, state)
+
+            if cheapest:
+                saving = ""
+                if base and base["price"] is not None and cheapest["date"] != base["date"]:
+                    diff = base["price"] - cheapest["price"]
+                    if diff > 0:
+                        saving = f" (saves {CURRENCY} {diff:.2f} vs {base['date']})"
+                log(f"  Cheapest: {cheapest['date']} at {CURRENCY} {cheapest['price']:.2f}{saving}\n")
+                send_telegram(
+                    f"📅 *{_esc_md(label)}* date scan (±{days}d)\n"
+                    f"Cheapest: {cheapest['date']} — {CURRENCY} {cheapest['price']:.2f}{saving}"
+                )
+            else:
+                log("  No offers found in window.\n")
+
         save_json(STATE_FILE, state)
-
-        if cheapest:
-            saving = ""
-            if base and base["price"] is not None and cheapest["date"] != base["date"]:
-                diff = base["price"] - cheapest["price"]
-                if diff > 0:
-                    saving = f" (saves {CURRENCY} {diff:.2f} vs {base['date']})"
-            log(f"  Cheapest: {cheapest['date']} at {CURRENCY} {cheapest['price']:.2f}{saving}\n")
-            send_telegram(
-                f"📅 *{label}* date scan (±{days}d)\n"
-                f"Cheapest: {cheapest['date']} — {CURRENCY} {cheapest['price']:.2f}{saving}"
-            )
-        else:
-            log("  No offers found in window.\n")
-
-    save_json(STATE_FILE, state)
     usage = current_usage()
     log(f"Done. API calls this month: {usage if usage is not None else 'unknown'}/{MONTHLY_CALL_CAP}{log_searches_left()}")
 
@@ -1162,9 +1213,10 @@ def _days_arg(argv: list[str], default: int) -> int:
 
 def run_trim(days: int) -> None:
     """Manually prune history, the response archive, and log lines to the last `days` days."""
-    state = load_json(STATE_FILE)
-    hist_removed, resp_removed, log_removed = trim_old_data(state, days)
-    save_json(STATE_FILE, state)
+    with state_lock():
+        state = load_json(STATE_FILE)
+        hist_removed, resp_removed, log_removed = trim_old_data(state, days)
+        save_json(STATE_FILE, state)
     log(
         f"Trimmed to last {days} days: removed {hist_removed} history point(s), "
         f"{resp_removed} archived response(s), and {log_removed} log line(s)."
@@ -1212,105 +1264,106 @@ def main() -> None:
         )
         return
 
-    state = load_json(STATE_FILE)
+    with state_lock():
+        state = load_json(STATE_FILE)
 
-    # 1 search call per simple route, N per N-leg multi-leg route (SerpAPI uses
-    # a single API key, no separate token call).
-    calls_needed = sum(route_search_cost(r) for r in routes)
-    if not can_make_calls(calls_needed):
-        usage = current_usage()
-        if usage is None:
+        # 1 search call per simple route, N per N-leg multi-leg route (SerpAPI uses
+        # a single API key, no separate token call).
+        calls_needed = sum(route_search_cost(r) for r in routes)
+        if not can_make_calls(calls_needed):
+            usage = current_usage()
+            if usage is None:
+                log(
+                    "Could not verify real SerpAPI usage (account sync failed). "
+                    "Skipping this run rather than risk exceeding the cap."
+                )
+                return
             log(
-                "Could not verify real SerpAPI usage (account sync failed). "
-                "Skipping this run rather than risk exceeding the cap."
+                f"Monthly cap would be exceeded ({usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used). "
+                f"Need {calls_needed} calls. Skipping."
             )
+            # Notify once per month so you know checks have paused, without spamming on
+            # every subsequent run until the counter resets.
+            if state.get("cap_alert_month") != month_key():
+                state["cap_alert_month"] = month_key()
+                send_telegram(
+                    "⛔ *FareMonkey: monthly search cap reached*\n"
+                    f"{usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used this month "
+                    f"({month_key()}). Price checks are paused until next month or until "
+                    "you raise `MONTHLY_CALL_CAP`."
+                )
+            save_json(STATE_FILE, state)
             return
-        log(
-            f"Monthly cap would be exceeded ({usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used). "
-            f"Need {calls_needed} calls. Skipping."
-        )
-        # Notify once per month so you know checks have paused, without spamming on
-        # every subsequent run until the counter resets.
-        if state.get("cap_alert_month") != month_key():
-            state["cap_alert_month"] = month_key()
-            send_telegram(
-                "⛔ *FareMonkey: monthly search cap reached*\n"
-                f"{usage}/{MONTHLY_CALL_CAP} real SerpAPI searches used this month "
-                f"({month_key()}). Price checks are paused until next month or until "
-                "you raise `MONTHLY_CALL_CAP`."
-            )
-        save_json(STATE_FILE, state)
-        return
 
-    prices = state.setdefault("prices", {})
-    now_str = current_local_time().isoformat()
+        prices = state.setdefault("prices", {})
+        now_str = current_local_time().isoformat()
 
-    for route in routes:
-        try:
-            label = route_label(route)
-            log(f"Checking {label} ...")
+        for route in routes:
+            try:
+                label = route_label(route)
+                log(f"Checking {label} ...")
 
-            offer = search_cheapest(route)
-            increment_call_count(state, route_search_cost(route))
+                offer = search_cheapest(route)
+                increment_call_count(state, route_search_cost(route))
 
-            if offer is None:
-                log(f"  No offers found for {label}")
+                if offer is None:
+                    log(f"  No offers found for {label}")
+                    continue
+
+                price = offer["price"]
+                details = {k: v for k, v in offer.items() if k != "price"}
+
+                prev = prices.get(label, {}).get("price")
+                history = prices.get(label, {}).get("history", [])
+                history.append({"price": price, "timestamp": now_str})
+                if len(history) > MAX_HISTORY:
+                    history = history[-MAX_HISTORY:]
+                prices[label] = {
+                    "price": price,
+                    "previous_price": prev,
+                    "updated": now_str,
+                    "details": details,
+                    "history": history,
+                }
+                log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev is not None else "") + log_searches_left())
+                log(f"  {format_offer(offer)}")
+
+                pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
+                significant = pct_change is not None and abs(pct_change) >= ALERT_THRESHOLD_PCT
+
+                if pct_change is None:
+                    icon = "🐒"
+                    log("  First check — baseline recorded.")
+                elif pct_change <= -ALERT_THRESHOLD_PCT:
+                    icon = "✈️"
+                elif pct_change >= ALERT_THRESHOLD_PCT:
+                    icon = "⚠️"
+                elif pct_change == 0:
+                    icon = "➡️"
+                else:
+                    icon = "🔹"
+
+                if NOTIFY_EVERY_RUN or significant:
+                    send_telegram(format_telegram(route, offer, icon, pct_change))
+            except Exception as e:
+                log(f"  Error processing {label}: {e}")
                 continue
 
-            price = offer["price"]
-            details = {k: v for k, v in offer.items() if k != "price"}
+        state["last_run"] = now_str
 
-            prev = prices.get(label, {}).get("price")
-            history = prices.get(label, {}).get("history", [])
-            history.append({"price": price, "timestamp": now_str})
-            if len(history) > MAX_HISTORY:
-                history = history[-MAX_HISTORY:]
-            prices[label] = {
-                "price": price,
-                "previous_price": prev,
-                "updated": now_str,
-                "details": details,
-                "history": history,
-            }
-            log(f"  Current: {CURRENCY} {price:.2f}" + (f" | Previous: {CURRENCY} {prev:.2f}" if prev is not None else "") + log_searches_left())
-            log(f"  {format_offer(offer)}")
+        # sync_and_persist_account_quota() (above) persisted this_month_usage as of
+        # process start, before any of this run's own searches. Refresh it here with
+        # those searches folded in (current_usage(), no extra API call) so the
+        # dashboard reflects them immediately instead of only after the next run's
+        # sync — reusing the state dict already headed for the save below rather
+        # than another separate read/write of state.json.
+        if _calls_made_this_run and current_usage() is not None and "account_usage" in state:
+            state["account_usage"]["this_month_usage"] = current_usage()
 
-            pct_change = ((price - prev) / prev) * 100 if (prev is not None and prev > 0) else None
-            significant = pct_change is not None and abs(pct_change) >= ALERT_THRESHOLD_PCT
-
-            if pct_change is None:
-                icon = "🐒"
-                log("  First check — baseline recorded.")
-            elif pct_change <= -ALERT_THRESHOLD_PCT:
-                icon = "✈️"
-            elif pct_change >= ALERT_THRESHOLD_PCT:
-                icon = "⚠️"
-            elif pct_change == 0:
-                icon = "➡️"
-            else:
-                icon = "🔹"
-
-            if NOTIFY_EVERY_RUN or significant:
-                send_telegram(format_telegram(route, offer, icon, pct_change))
-        except Exception as e:
-            log(f"  Error processing {label}: {e}")
-            continue
-
-    state["last_run"] = now_str
-
-    # sync_and_persist_account_quota() (above) persisted this_month_usage as of
-    # process start, before any of this run's own searches. Refresh it here with
-    # those searches folded in (current_usage(), no extra API call) so the
-    # dashboard reflects them immediately instead of only after the next run's
-    # sync — reusing the state dict already headed for the save below rather
-    # than another separate read/write of state.json.
-    if _calls_made_this_run and current_usage() is not None and "account_usage" in state:
-        state["account_usage"]["this_month_usage"] = current_usage()
-
-    # Keep the dataset bounded: prune history, archived responses, and log lines
-    # past the retention window every run so local files don't grow forever.
-    hist_removed, resp_removed, log_removed = trim_old_data(state, RETENTION_DAYS)
-    save_json(STATE_FILE, state)
+        # Keep the dataset bounded: prune history, archived responses, and log lines
+        # past the retention window every run so local files don't grow forever.
+        hist_removed, resp_removed, log_removed = trim_old_data(state, RETENTION_DAYS)
+        save_json(STATE_FILE, state)
     if hist_removed or resp_removed or log_removed:
         log(
             f"Trimmed {hist_removed} history point(s), {resp_removed} archived "

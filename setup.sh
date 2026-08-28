@@ -124,12 +124,13 @@ sys.exit(0 if ok else 1)
 EOF
 }
 
-if deps_satisfied >/tmp/faremonkey_deps_check.$$ 2>&1; then
+DEPS_CHECK_TMP="$(mktemp)"
+if deps_satisfied >"$DEPS_CHECK_TMP" 2>&1; then
     ok "Python dependencies already satisfy requirements.txt — nothing to install"
-    rm -f /tmp/faremonkey_deps_check.$$
+    rm -f "$DEPS_CHECK_TMP"
 else
-    cat /tmp/faremonkey_deps_check.$$
-    rm -f /tmp/faremonkey_deps_check.$$
+    cat "$DEPS_CHECK_TMP"
+    rm -f "$DEPS_CHECK_TMP"
     if "$VENV_PY" -m pip install -r requirements.txt; then
         ok "Python dependencies installed into $VENV_DIR"
     else
@@ -156,6 +157,7 @@ fi
 echo
 if [ ! -f .env ]; then
     cp .env.example .env
+    chmod 600 .env
     warn "Created .env from .env.example — edit it and fill in your credentials."
 else
     ok ".env already exists"

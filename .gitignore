@@ -151,6 +151,7 @@ activemq-data/
 # (copy routes.example.json to routes.json and edit it)
 routes.json
 state.json
+state.json.lock
 responses.jsonl
 flight_monitor.log
 

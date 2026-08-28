@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -14,6 +15,13 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request
 
+# route_label()/route_search_cost() must stay identical to flight_monitor.py's
+# versions — they derive the exact state.json keys the monitor writes and the
+# dashboard reads, and the real per-route SerpAPI cost the schedule page and
+# MONTHLY_CALL_CAP pre-checks rely on. Import rather than re-implement so the
+# two processes can't silently drift out of sync.
+from flight_monitor import _is_legs_route, route_label, route_search_cost, state_lock  # noqa: F401
+
 try:
     from dotenv import load_dotenv
 
@@ -22,6 +30,10 @@ except ImportError:
     pass  # python-dotenv is optional; cron/CI inject env vars directly
 
 app = Flask(__name__)
+# The dashboard is LAN-reachable with no auth (see CLAUDE.md); cap request
+# bodies so a stray or malformed POST to /api/routes can't buffer an
+# arbitrarily large body into memory before validation even runs.
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024  # 1 MB
 
 BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / "state.json"
@@ -93,7 +105,12 @@ def validate_routes(routes) -> list[str]:
             else:
                 for j, leg in enumerate(legs):
                     missing = [
-                        f for f in REQUIRED_LEG_FIELDS if not (isinstance(leg, dict) and leg.get(f))
+                        f for f in REQUIRED_LEG_FIELDS
+                        if not (
+                            isinstance(leg, dict)
+                            and isinstance(leg.get(f), str)
+                            and leg.get(f).strip()
+                        )
                     ]
                     if missing:
                         errors.append(
@@ -128,10 +145,13 @@ def validate_routes(routes) -> list[str]:
                 errors.append(f"Route {i + 1}: teens must be a non-negative integer")
         if "max_duration_hours" in route and route["max_duration_hours"] not in (None, ""):
             try:
-                if float(route["max_duration_hours"]) <= 0:
+                duration = float(route["max_duration_hours"])
+                if not math.isfinite(duration) or duration <= 0:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"Route {i + 1}: max_duration_hours must be a positive number")
+        if "non_stop" in route and not isinstance(route["non_stop"], bool):
+            errors.append(f"Route {i + 1}: non_stop must be true or false")
         travel_class = route.get("travel_class")
         if travel_class and travel_class not in TRAVEL_CLASSES:
             errors.append(f"Route {i + 1}: travel_class must be one of {', '.join(TRAVEL_CLASSES)}")
@@ -299,14 +319,15 @@ def api_route_data_delete(label):
     narrow, user-initiated removal of a single route label, not a
     read-modify-write of prices the monitor is actively maintaining.
     """
-    state = load_json(STATE_FILE)
-    prices = state.get("prices", {})
-    flex_scans = state.get("flex_scans", {})
-    if label not in prices and label not in flex_scans:
-        return jsonify({"errors": [f"No data found for '{label}'"]}), 404
-    prices.pop(label, None)
-    flex_scans.pop(label, None)
-    save_json_atomic(STATE_FILE, state)
+    with state_lock():
+        state = load_json(STATE_FILE)
+        prices = state.get("prices", {})
+        flex_scans = state.get("flex_scans", {})
+        if label not in prices and label not in flex_scans:
+            return jsonify({"errors": [f"No data found for '{label}'"]}), 404
+        prices.pop(label, None)
+        flex_scans.pop(label, None)
+        save_json_atomic(STATE_FILE, state)
     return jsonify({"ok": True})
 
 
@@ -375,36 +396,6 @@ def api_routes_save():
 # running on the machine that runs the scheduled monitor, so "publish" always
 # means "the crontab of whatever machine app.py is currently running on."
 # ---------------------------------------------------------------------------
-
-
-def route_label(route: dict) -> str:
-    """Same label flight_monitor.py uses for state.json keys.
-
-    Simple route: "ORIGIN-DEST DATE". Multi-leg (legs) route: the airport
-    chain joined by "-" (first leg's origin, then every leg's destination in
-    order) plus the first leg's date, e.g. "JFK-HEL-BER-JFK 2026-09-15".
-    """
-    legs = route.get("legs")
-    if isinstance(legs, list) and legs:
-        chain = [str((legs[0] or {}).get("origin", "?"))] + [
-            str((leg or {}).get("destination", "?")) for leg in legs
-        ]
-        return f"{'-'.join(chain)} {(legs[0] or {}).get('date', '?')}"
-    return f"{route.get('origin', '?')}-{route.get('destination', '?')} {route.get('departure_date', '?')}"
-
-
-def route_search_cost(route: dict) -> int:
-    """Real SerpAPI searches one check of this route costs.
-
-    Mirrors flight_monitor.route_search_cost(): a legs-shaped route is priced
-    as one independent one-way search per leg (see
-    flight_monitor._search_multi_leg), not a single multi-city call, so its
-    cost is len(legs), not 1.
-    """
-    legs = route.get("legs")
-    if isinstance(legs, list):
-        return len(legs)
-    return 1
 
 
 def route_times(route: dict) -> list[str]:
@@ -526,6 +517,18 @@ def read_crontab() -> str:
     return result.stdout
 
 
+def _expand_cron_field(field: str) -> list[int] | None:
+    """Expand a comma-separated cron field of plain integers (e.g. "7,13,19")
+    into individual values. Returns None if the field isn't plain digits/commas
+    (a range or step like "1-5" or "*/6" isn't something this app ever writes
+    or accepts from /schedule, so such a line is left alone, same as before).
+    """
+    parts = field.split(",")
+    if not parts or not all(p.isdigit() for p in parts):
+        return None
+    return [int(p) for p in parts]
+
+
 def current_schedule() -> list[str]:
     """Extract HH:MM times from the FareMonkey-managed crontab block, if any."""
     body = read_crontab()
@@ -540,9 +543,15 @@ def current_schedule() -> list[str]:
         parts = line.split()
         if len(parts) < 5:
             continue
-        minute, hour = parts[0], parts[1]
-        if minute.isdigit() and hour.isdigit():
-            times.append(f"{int(hour):02d}:{int(minute):02d}")
+        # A hand-installed line following CLAUDE.md's documented default
+        # ("30 7,13,19 * * * ...") uses a comma-separated hour list rather
+        # than one line per time — expand both fields so that's recognized too.
+        minutes = _expand_cron_field(parts[0])
+        hours = _expand_cron_field(parts[1])
+        if minutes and hours:
+            for h in hours:
+                for m in minutes:
+                    times.append(f"{h:02d}:{m:02d}")
     return sorted(set(times))
 
 
@@ -561,6 +570,13 @@ def build_cron_block(times: list[str]) -> str:
 
 def publish_schedule(times: list[str]) -> None:
     existing = read_crontab()
+    if CRON_BEGIN in existing and CRON_END not in existing:
+        # Already-malformed crontab (truncated FareMonkey block) — refuse
+        # rather than append a second, well-formed block after the broken one.
+        raise RuntimeError(
+            f"Crontab has a {CRON_BEGIN!r} marker with no matching {CRON_END!r} — "
+            "fix or remove the incomplete FareMonkey block by hand before publishing."
+        )
     if CRON_BEGIN in existing and CRON_END in existing:
         before = existing.split(CRON_BEGIN, 1)[0]
         after = existing.split(CRON_END, 1)[1]
