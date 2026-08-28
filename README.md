@@ -317,6 +317,7 @@ The default `MONTHLY_CALL_CAP=240` leaves a comfortable buffer below a 250-searc
 | `.venv/` | Project virtual environment holding all dependencies (auto-generated, **local only / gitignored**) |
 | `.env.example` | Template for local environment variables |
 | `tests/test_flight_monitor.py` | Pytest suite for pure-logic functions (no live API calls) |
+| `tests/test_app.py` | Pytest suite for the Flask dashboard: route validation, the delete endpoint, and cron schedule logic (crontab mocked) |
 | `.github/workflows/monitor.yml` | GitHub Actions workflow (manual-only smoke test; commits no data) |
 | `.github/workflows/tests.yml` | GitHub Actions test matrix across Python 3.9–3.13 (no API calls) |
 

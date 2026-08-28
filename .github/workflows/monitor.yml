@@ -44,4 +44,8 @@ jobs:
           ACTIVE_END: ${{ vars.ACTIVE_END || '22' }}
           ALERT_THRESHOLD_PCT: ${{ vars.ALERT_THRESHOLD_PCT || '3' }}
           MONTHLY_CALL_CAP: ${{ vars.MONTHLY_CALL_CAP || '240' }}
-        run: python flight_monitor.py
+        # --force bypasses the run_times/active-hours check: routes.example.json's
+        # times are tied to America/New_York, so a manual trigger at an arbitrary
+        # time would otherwise almost always skip every route and make zero real
+        # API calls, defeating the point of a connectivity/credentials smoke test.
+        run: python flight_monitor.py --force
