@@ -696,11 +696,13 @@ class TestFormatTelegram:
         "total_duration": 900,
         "legs": [
             {"origin": "JFK", "destination": "HEL", "date": "2026-09-15", "price": 1000.0,
-             "departure_time": "2026-09-15 08:00", "arrival_time": "2026-09-15 20:00"},
+             "departure_time": "2026-09-15 08:00", "arrival_time": "2026-09-15 20:00",
+             "total_duration": 625},
             {"origin": "HEL", "destination": "BER", "date": "2026-09-20", "price": 2000.0,
-             "departure_time": "2026-09-20 09:00", "arrival_time": "2026-09-20 11:00"},
+             "departure_time": "2026-09-20 09:00", "arrival_time": "2026-09-20 11:00",
+             "total_duration": 120},
             {"origin": "BER", "destination": "JFK", "date": "2026-09-25", "price": 3000.0,
-             "departure_time": None, "arrival_time": None},
+             "departure_time": None, "arrival_time": None, "total_duration": None},
         ],
     }
 
@@ -709,8 +711,8 @@ class TestFormatTelegram:
         # .env would otherwise decide whether this assertion holds.
         with mock.patch.object(fm, "CURRENCY", "USD"):
             msg = fm.format_telegram(self.LEGS_ROUTE, self.LEGS_OFFER, "🐒", None)
-        assert "Leg 1: JFK → HEL | Sep 15 | 08:00 → 20:00 | USD 1,000" in msg
-        assert "Leg 2: HEL → BER | Sep 20 | 09:00 → 11:00 | USD 2,000" in msg
+        assert "Leg 1: JFK → HEL | Sep 15 | 08:00 → 20:00 | 10h 25m | USD 1,000" in msg
+        assert "Leg 2: HEL → BER | Sep 20 | 09:00 → 11:00 | 2h 00m | USD 2,000" in msg
         assert "Leg 3: BER → JFK | Sep 25 | flight times not available | USD 3,000" in msg
 
     def test_legs_no_outbound_inbound_wording(self):
