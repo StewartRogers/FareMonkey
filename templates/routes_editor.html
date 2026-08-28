@@ -82,6 +82,14 @@
     let publishedTimes = [];
     let dirty = false;
 
+    // Route/leg field values round-trip through routes.json unvalidated for
+    // format (validate_routes only checks legs fields are non-empty, not IATA/date
+    // shaped), and /api/routes has no auth — so a crafted value must not be able
+    // to break out of these attributes when rendered back into innerHTML.
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
     // Any edit — typing in a field, toggling a checkbox, picking a time —
     // marks the form dirty so beforeunload can warn before it's lost.
     routesEl.addEventListener('input', () => { dirty = true; });
@@ -107,28 +115,28 @@
       const runTimes = route.run_times || (legacy ? migrateRunHours(route.run_hours) : []);
       const hint = runTimes.length
         ? (legacy
-            ? `Converted from run_hours [${route.run_hours.join(', ')}] — saving stores these times.`
+            ? `Converted from run_hours [${esc(route.run_hours.join(', '))}] — saving stores these times.`
             : 'The crontab is the union of every route\'s run times.')
         : 'No times of its own — this route is checked on every firing other routes schedule.';
       const timesBlock = `
         <div class="times-cell">
           <label>Run times</label>
           <div class="times" data-f="run_times">
-            ${runTimes.map(t => `<span class="time-chip"><input type="time" value="${t}"><button type="button" data-remove-time>×</button></span>`).join('')}
+            ${runTimes.map(t => `<span class="time-chip"><input type="time" value="${esc(t)}"><button type="button" data-remove-time>×</button></span>`).join('')}
             <button type="button" class="btn-time" data-add-time="${i}">+ Add time</button>
           </div>
           <div class="hint">${hint}</div>
         </div>
       `;
       const sharedFields = `
-        <div><label>Adults</label><input data-f="adults" type="number" min="1" value="${route.adults ?? 1}"></div>
-        <div><label>Teens (12-17)</label><input data-f="teens" type="number" min="0" value="${route.teens ?? 0}"></div>
+        <div><label>Adults</label><input data-f="adults" type="number" min="1" value="${esc(route.adults ?? 1)}"></div>
+        <div><label>Teens (12-17)</label><input data-f="teens" type="number" min="0" value="${esc(route.teens ?? 0)}"></div>
         <div><label>Travel class</label>
           <select data-f="travel_class">
             ${TRAVEL_CLASSES.map(c => `<option value="${c}" ${(route.travel_class || 'ECONOMY') === c ? 'selected' : ''}>${c}</option>`).join('')}
           </select>
         </div>
-        <div><label>Max duration, hours (optional)</label><input data-f="max_duration_hours" type="number" min="0" step="0.5" value="${route.max_duration_hours ?? ''}" placeholder="e.g. 24"></div>
+        <div><label>Max duration, hours (optional)</label><input data-f="max_duration_hours" type="number" min="0" step="0.5" value="${esc(route.max_duration_hours ?? '')}" placeholder="e.g. 24"></div>
         <div class="checkbox-row"><input data-f="non_stop" type="checkbox" ${route.non_stop !== false ? 'checked' : ''}><label style="text-transform:none">Nonstop only</label></div>
         ${timesBlock}
       `;
@@ -145,10 +153,10 @@
               <div class="legs-list" data-f="legs">
                 ${legs.map(leg => `
                   <div class="leg-row">
-                    <input data-lf="origin" maxlength="3" value="${leg.origin || ''}" placeholder="JFK">
+                    <input data-lf="origin" maxlength="3" value="${esc(leg.origin || '')}" placeholder="JFK">
                     <span class="leg-arrow">→</span>
-                    <input data-lf="destination" maxlength="3" value="${leg.destination || ''}" placeholder="HEL">
-                    <input data-lf="date" type="date" value="${leg.date || ''}">
+                    <input data-lf="destination" maxlength="3" value="${esc(leg.destination || '')}" placeholder="HEL">
+                    <input data-lf="date" type="date" value="${esc(leg.date || '')}">
                     <button type="button" class="leg-remove" data-remove-leg ${legs.length <= 2 ? 'disabled' : ''}>×</button>
                   </div>
                 `).join('')}
@@ -165,10 +173,10 @@
 
       div.innerHTML = `
         <div class="grid">
-          <div><label>Origin (IATA)</label><input data-f="origin" maxlength="3" value="${route.origin || ''}" placeholder="JFK"></div>
-          <div><label>Destination (IATA)</label><input data-f="destination" maxlength="3" value="${route.destination || ''}" placeholder="LHR"></div>
-          <div><label>Departure date</label><input data-f="departure_date" type="date" value="${route.departure_date || ''}"></div>
-          <div><label>Return date (optional)</label><input data-f="return_date" type="date" value="${route.return_date || ''}"></div>
+          <div><label>Origin (IATA)</label><input data-f="origin" maxlength="3" value="${esc(route.origin || '')}" placeholder="JFK"></div>
+          <div><label>Destination (IATA)</label><input data-f="destination" maxlength="3" value="${esc(route.destination || '')}" placeholder="LHR"></div>
+          <div><label>Departure date</label><input data-f="departure_date" type="date" value="${esc(route.departure_date || '')}"></div>
+          <div><label>Return date (optional)</label><input data-f="return_date" type="date" value="${esc(route.return_date || '')}"></div>
           ${sharedFields}
         </div>
         <div class="row-actions"><button class="btn-remove" data-remove="${i}">Remove</button></div>
@@ -232,7 +240,7 @@
       const times = [...new Set(routes.flatMap(r => r.run_times || []))].sort();
       const everyFiring = routes.filter(r => !(r.run_times || []).length).length;
       planEl.innerHTML = times.length
-        ? `Crontab will fire at <strong>${times.join(', ')}</strong>`
+        ? `Crontab will fire at <strong>${esc(times.join(', '))}</strong>`
           + (everyFiring ? ` — ${everyFiring} route(s) with no times of their own run at all of them.` : '.')
           + ' Publish it on the <a href="/schedule" style="color:#38bdf8">Schedule</a> page.'
         : 'No route declares a run time yet, so the schedule falls back to whatever is already published.';

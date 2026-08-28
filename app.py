@@ -80,9 +80,13 @@ def validate_routes(routes) -> list[str]:
             errors.append(f"Route {i + 1}: must be an object")
             continue
         if "legs" in route:
-            # Multi-leg (multi-city) route: no editor UI builds these yet (hand-edited
-            # into routes.json), so validation here is deliberately loose — just enough
-            # to keep an obviously-malformed entry from being silently saved.
+            # Multi-leg (multi-city) route: validation here is deliberately loose (no
+            # IATA/date format check per leg, unlike the simple-route fields below) so
+            # a hand-edited routes.json keeps working — just enough to keep an
+            # obviously-malformed entry from being silently saved. The /routes editor
+            # itself uppercases/shapes each leg client-side before posting, and now
+            # escapes every field before re-rendering it, so a leg value that fails
+            # this loose check still can't inject HTML into that page.
             legs = route.get("legs")
             if not isinstance(legs, list) or len(legs) < 2:
                 errors.append(f"Route {i + 1}: 'legs' must be a list of at least 2 legs")
