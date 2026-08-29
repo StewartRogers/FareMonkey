@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import json
 import os
+import socket
 import sys
 import tempfile
 from datetime import datetime, timedelta
@@ -37,6 +38,10 @@ for _stream in (sys.stdout, sys.stderr):
 SERPAPI_API_KEY = os.environ.get("SERPAPI_API_KEY", "")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Prefixed onto every Telegram message so, if more than one machine (or a stray
+# manual/CI run) ever posts to the same bot/chat, it's obvious at a glance which
+# one sent it instead of having to reconstruct that from logs after the fact.
+HOSTNAME = socket.gethostname()
 CURRENCY = os.environ.get("CURRENCY", "USD")
 TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 ACTIVE_START = int(os.environ.get("ACTIVE_START", "7"))
@@ -1020,6 +1025,7 @@ def format_telegram(route: dict, offer: dict, icon: str,
 
 
 def send_telegram(message: str) -> None:
+    message = f"📍 {_esc_md(HOSTNAME)}\n{message}"
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log(f"  [Telegram disabled] {message}")
         return

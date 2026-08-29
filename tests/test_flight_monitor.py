@@ -1268,7 +1268,7 @@ class TestSendTelegram:
             fm.send_telegram("hello *bold*")
         payload = mock_post.call_args[1]["json"]
         assert payload["parse_mode"] == "Markdown"
-        assert payload["text"] == "hello *bold*"
+        assert payload["text"] == f"📍 {fm.HOSTNAME}\nhello *bold*"
 
     def test_retries_without_markdown_on_parse_error(self):
         fail_resp = mock.Mock()

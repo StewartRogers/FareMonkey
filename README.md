@@ -12,6 +12,8 @@ Flight price monitor that tracks fares via the [SerpAPI Google Flights API](http
 6. Runs on a schedule via local cron (state is kept local only, never pushed to GitHub)
 7. Flask dashboard at `http://localhost:5000` shows live charts of price history
 
+Every Telegram message is prefixed with the sending machine's hostname (e.g. `📍 my-pi`) — if you ever run the monitor from more than one machine against the same bot/chat, this makes it obvious at a glance which one an alert came from.
+
 ## Quick start
 
 ### 1. Get API credentials
