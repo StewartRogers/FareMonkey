@@ -36,8 +36,13 @@ jobs:
       - name: Run flight monitor
         env:
           SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Deliberately no TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID here: this smoke
+          # test seeds routes.json from the template (JFK-LHR, SFO-NRT — not the
+          # user's real routes) and always starts from an empty state.json (fresh
+          # checkout each run), so a real Telegram alert would be confusing
+          # (unrecognized routes, no price history) and unwanted. Omitting the
+          # credentials makes send_telegram() log "Telegram disabled" instead of
+          # sending — SERPAPI_API_KEY is still exercised, which is the point.
           CURRENCY: ${{ vars.CURRENCY || 'USD' }}
           TIMEZONE: ${{ vars.TIMEZONE || 'America/New_York' }}
           ACTIVE_START: ${{ vars.ACTIVE_START || '7' }}
