@@ -942,11 +942,17 @@ def format_telegram(route: dict, offer: dict, icon: str,
     else:
         header = f"{icon} {_esc_md(route['origin'])} → {_esc_md(route['destination'])} ({pax})"
 
-    # Price + change + flight summary — all on one line
+    # Price + change + flight summary — all on one line. pct_change is None only
+    # on a genuine first check (no previous price to compare against) — once
+    # there's a previous run to compare to, always say so, even when the price
+    # hasn't moved, so "unchanged" and "never checked before" don't look the same.
     price_str = f"{CURRENCY} {_format_price(price)}"
-    if pct_change is not None and pct_change != 0:
-        arrow = "↓" if pct_change < 0 else "↑"
-        price_str += f" ({arrow}{abs(pct_change):.1f}%)"
+    if pct_change is not None:
+        if pct_change == 0:
+            price_str += " (no change)"
+        else:
+            arrow = "↓" if pct_change < 0 else "↑"
+            price_str += f" ({arrow}{abs(pct_change):.1f}%)"
     parts = [price_str]
     level = offer.get("price_level")
     if level:

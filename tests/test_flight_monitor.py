@@ -610,10 +610,14 @@ class TestFormatTelegram:
         assert "↑" not in msg
         assert "CAD 4,373" in msg
 
-    def test_no_change_no_arrow(self):
+    def test_no_change_shows_no_change_not_silence(self):
+        # A real comparison against a previous run (pct_change == 0) must say
+        # so explicitly, distinct from a first check (pct_change is None) —
+        # otherwise "unchanged" and "never checked before" look identical.
         msg = fm.format_telegram(self.ROUTE, self.OFFER, "➡️", 0)
         assert "↓" not in msg
         assert "↑" not in msg
+        assert "(no change)" in msg
 
     def test_price_level_on_summary_line(self):
         msg = fm.format_telegram(self.ROUTE, self.OFFER, "✈️", -1.0)
