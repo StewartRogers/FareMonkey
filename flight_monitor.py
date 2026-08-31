@@ -919,6 +919,25 @@ def _esc_md(text) -> str:
     return s
 
 
+def _legs_to_flight_path(legs: list) -> str:
+    """Mirrors legsToFlightPath() in templates/schedule.html: chains each leg
+    onto the last as long as it picks up where the previous one left off, and
+    starts a new "✈"-joined segment when a leg skips ahead instead of
+    pretending a multi-leg itinerary with a gap is one unbroken trip.
+    """
+    segments = []
+    current = None
+    for leg in legs:
+        origin = _esc_md((leg or {}).get("origin", "?"))
+        dest = _esc_md((leg or {}).get("destination", "?"))
+        if current and current[-1] == origin:
+            current.append(dest)
+        else:
+            current = [origin, dest]
+            segments.append(current)
+    return "  |  ".join(" ✈ ".join(seg) for seg in segments)
+
+
 def format_telegram(route: dict, offer: dict, icon: str,
                     pct_change: float | None) -> str:
     """Build the full Telegram alert message for a route check."""
@@ -934,10 +953,7 @@ def format_telegram(route: dict, offer: dict, icon: str,
     is_legs = _is_legs_route(route)
     if is_legs:
         legs = route.get("legs") or []
-        chain = " → ".join(
-            [_esc_md((legs[0] or {}).get("origin", "?"))]
-            + [_esc_md((leg or {}).get("destination", "?")) for leg in legs]
-        )
+        chain = _legs_to_flight_path(legs)
         header = f"{icon} {chain} ({pax})"
     else:
         header = f"{icon} {_esc_md(route['origin'])} → {_esc_md(route['destination'])} ({pax})"

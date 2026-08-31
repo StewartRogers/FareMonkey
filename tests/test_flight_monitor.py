@@ -691,7 +691,23 @@ class TestFormatTelegram:
     def test_legs_header_lists_full_chain(self):
         msg = fm.format_telegram(self.LEGS_ROUTE, self.OFFER, "🐒", None)
         lines = msg.split("\n")
-        assert lines[0] == "🐒 JFK → HEL → BER → JFK (1 pax)"
+        assert lines[0] == "🐒 JFK ✈ HEL ✈ BER ✈ JFK (1 pax)"
+
+    def test_legs_header_splits_on_gap(self):
+        # A leg that doesn't pick up where the last one left off (e.g. an
+        # open-jaw skip) must start a new "✈"-joined segment rather than
+        # rendering as one unbroken chain — mirrors legsToFlightPath() in
+        # templates/schedule.html.
+        route = {
+            "legs": [
+                {"origin": "YVR", "destination": "HEL", "date": "2026-09-15"},
+                {"origin": "BER", "destination": "YVR", "date": "2026-09-25"},
+            ],
+            "adults": 1,
+        }
+        msg = fm.format_telegram(route, self.OFFER, "🐒", None)
+        lines = msg.split("\n")
+        assert lines[0] == "🐒 YVR ✈ HEL  |  BER ✈ YVR (1 pax)"
 
     LEGS_OFFER = {
         "price": 6000.0,
