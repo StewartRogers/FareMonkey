@@ -7,6 +7,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import socket
 import sys
 import tempfile
@@ -142,6 +143,15 @@ def save_json(path: Path, data: dict) -> None:
         raise
 
 
+def _open_private(path: Path, mode: str = "a", **kwargs):
+    """open() for appending, creating the file owner-only (0600) if it doesn't
+    exist yet. The log, response archive, and lock file sit next to .env in the
+    project directory; a default-umask open() would leave them world-readable,
+    which matters for the log in particular since it records error messages."""
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    return os.fdopen(fd, mode, **kwargs)
+
+
 @contextlib.contextmanager
 def state_lock():
     """Cross-process advisory lock guarding a state.json read-modify-write cycle.
@@ -155,10 +165,18 @@ def state_lock():
     concurrent writer waits its turn instead of racing. Advisory + POSIX-only
     (fcntl.flock) — fine here since this only ever runs on Linux.
     """
-    with open(STATE_LOCK_FILE, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with _open_private(STATE_LOCK_FILE) as f:
+        # Yields whether another process held the lock first, so callers that
+        # synced SerpAPI usage before taking the lock know that figure may now
+        # be stale (the other holder may have spent searches meanwhile).
         try:
-            yield
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            waited = False
+        except BlockingIOError:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            waited = True
+        try:
+            yield waited
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
 
@@ -193,6 +211,78 @@ def route_label(route: dict) -> str:
     return f"{route.get('origin', '?')}-{route.get('destination', '?')} {route.get('departure_date', '?')}"
 
 
+def _is_iso_date(value) -> bool:
+    """True for a real calendar date written as YYYY-MM-DD."""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _is_int(value) -> bool:
+    # bool is an int subclass, but `"adults": true` is a typo, not a count.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def route_problems(route) -> list[str]:
+    """Type/format problems with one routes.json entry (empty if it's usable).
+
+    routes.json is hand-editable and also writable through the dashboard, so
+    everything the monitor later relies on is checked up front: a bad value
+    here would otherwise surface mid-run as a crash (or a malformed SerpAPI
+    query that still costs a search).
+    """
+    if not isinstance(route, dict):
+        return ["must be a JSON object"]
+    problems = []
+    if _is_legs_route(route):
+        conflicting = [f for f in REQUIRED_ROUTE_FIELDS + ("return_date",) if route.get(f)]
+        if conflicting:
+            problems.append(f"'legs' cannot be combined with {', '.join(conflicting)}")
+        legs = route.get("legs")
+        if not isinstance(legs, list) or len(legs) < 2:
+            problems.append("'legs' must be a list of at least 2 {origin, destination, date} objects")
+        else:
+            for j, leg in enumerate(legs):
+                missing = [
+                    f for f in REQUIRED_LEG_FIELDS if not (isinstance(leg, dict) and leg.get(f))
+                ]
+                if missing:
+                    problems.append(f"leg {j}: missing required field(s): {', '.join(missing)}")
+                elif not _is_iso_date(leg["date"]):
+                    problems.append(f"leg {j}: date must be a real date (YYYY-MM-DD)")
+    else:
+        missing = [f for f in REQUIRED_ROUTE_FIELDS if not route.get(f)]
+        if missing:
+            problems.append(f"missing required field(s): {', '.join(missing)}")
+        for field in ("departure_date", "return_date"):
+            if route.get(field) and not _is_iso_date(route[field]):
+                problems.append(f"{field} must be a real date (YYYY-MM-DD)")
+    if "adults" in route and not (_is_int(route["adults"]) and route["adults"] >= 1):
+        problems.append("adults must be a positive integer")
+    if "teens" in route and not (_is_int(route["teens"]) and route["teens"] >= 0):
+        problems.append("teens must be a non-negative integer")
+    duration = route.get("max_duration_hours")
+    if duration is not None and not (
+        isinstance(duration, (int, float)) and not isinstance(duration, bool) and 0 < duration < float("inf")
+    ):
+        problems.append("max_duration_hours must be a positive number")
+    run_times = route.get("run_times")
+    if run_times is not None and not (
+        isinstance(run_times, list) and all(parse_run_time(t) is not None for t in run_times)
+    ):
+        problems.append('run_times must be a list of "HH:MM" times')
+    run_hours = route.get("run_hours")
+    if run_hours is not None and not (
+        isinstance(run_hours, list) and all(_is_int(h) and 0 <= h <= 23 for h in run_hours)
+    ):
+        problems.append("run_hours must be a list of hours (0-23)")
+    return problems
+
+
 def load_routes() -> list:
     """Load routes.json (a personal, gitignored config), or exit with guidance."""
     routes = load_json(ROUTES_FILE)
@@ -202,35 +292,22 @@ def load_routes() -> list:
             f"Copy routes.example.json to {ROUTES_FILE.name} and edit it."
         )
     for i, route in enumerate(routes):
-        if _is_legs_route(route):
-            conflicting = [f for f in REQUIRED_ROUTE_FIELDS + ("return_date",) if route.get(f)]
-            if conflicting:
-                sys.exit(
-                    f"Error: {ROUTES_FILE.name} entry {i}: 'legs' cannot be combined with "
-                    f"{', '.join(conflicting)}."
-                )
-            legs = route.get("legs")
-            if not isinstance(legs, list) or len(legs) < 2:
-                sys.exit(
-                    f"Error: {ROUTES_FILE.name} entry {i}: 'legs' must be a list of at "
-                    "least 2 {origin, destination, date} objects."
-                )
-            for j, leg in enumerate(legs):
-                missing = [
-                    f for f in REQUIRED_LEG_FIELDS if not (isinstance(leg, dict) and leg.get(f))
-                ]
-                if missing:
-                    sys.exit(
-                        f"Error: {ROUTES_FILE.name} entry {i} leg {j}: missing required "
-                        f"field(s): {', '.join(missing)}"
-                    )
-            continue
-        missing = [f for f in REQUIRED_ROUTE_FIELDS if not route.get(f)]
-        if missing:
-            sys.exit(
-                f"Error: {ROUTES_FILE.name} entry {i} is missing required field(s): "
-                f"{', '.join(missing)}"
-            )
+        problems = route_problems(route)
+        if problems:
+            sys.exit(f"Error: {ROUTES_FILE.name} entry {i}: {'; '.join(problems)}")
+    # state.json keys prices/flex_scans by route_label(), which leaves out
+    # return_date, travel_class, passengers, etc. Two routes sharing a label
+    # would overwrite each other's price and mix their histories, producing
+    # bogus %-change alerts on every run — refuse rather than corrupt the data.
+    labels = [route_label(r) for r in routes]
+    dupes = sorted({label for label in labels if labels.count(label) > 1})
+    if dupes:
+        sys.exit(
+            f"Error: {ROUTES_FILE.name} has more than one route labelled "
+            f"{', '.join(repr(d) for d in dupes)}. Routes need a distinct origin/"
+            "destination/departure date (or leg chain) so their price histories "
+            "don't overwrite each other."
+        )
     return routes
 
 
@@ -242,10 +319,30 @@ def current_local_time() -> datetime:
     return datetime.now(tz)
 
 
+# requests puts the full request URL in connection-error messages, and both
+# credentials travel in URLs: SerpAPI's as ?api_key=..., Telegram's as
+# /bot<TOKEN>/. Scrub them from every log line so a DNS blip can't write a live
+# secret to stdout/cron mail and flight_monitor.log.
+_SECRET_URL_PATTERNS = (
+    (re.compile(r"(api_key=)[^&\s)'\"]+"), r"\1***"),
+    (re.compile(r"/bot[^/\s]+/"), "/bot***/"),
+)
+
+
+def _redact(text: str) -> str:
+    """Remove credentials (by URL shape and by literal value) from `text`."""
+    for pattern, replacement in _SECRET_URL_PATTERNS:
+        text = pattern.sub(replacement, text)
+    for secret in (SERPAPI_API_KEY, TELEGRAM_BOT_TOKEN):
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 def _append_log_line(line: str) -> None:
     """Best-effort append to LOG_FILE — logging must never crash the monitor."""
     try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        with _open_private(LOG_FILE, encoding="utf-8") as f:
             f.write(line + "\n")
     except OSError:
         pass
@@ -262,7 +359,7 @@ def log(msg: str = "") -> None:
         _append_log_line("")
         return
     ts = current_local_time().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{ts}  {msg}"
+    line = f"{ts}  {_redact(msg)}"
     print(line)
     _append_log_line(line)
 
@@ -434,6 +531,23 @@ def sync_and_persist_account_quota() -> int | None:
     return left
 
 
+def resync_usage_if_waited(waited: bool) -> None:
+    """Refresh SerpAPI usage after waiting on state_lock().
+
+    The process-start sync ran before the lock was taken; if another monitor
+    process (a cron firing, a --scan) held the lock meanwhile, it may have spent
+    searches this process's figure doesn't include, and checking the cap
+    against it could approve a batch that overshoots MONTHLY_CALL_CAP. Fails
+    closed: if the refresh doesn't succeed, usage is treated as unknown.
+    """
+    global _this_month_usage
+    if not waited:
+        return
+    log("Waited for another FareMonkey process — re-checking SerpAPI usage.")
+    _this_month_usage = None
+    sync_account_quota()
+
+
 def decrement_searches_left() -> None:
     """Decrement the local remaining-searches counter after a search call."""
     global _searches_left
@@ -524,7 +638,7 @@ def archive_response(route: dict, params: dict, data: dict) -> None:
         "response": data,
     }
     try:
-        with open(RESPONSES_FILE, "a") as f:
+        with _open_private(RESPONSES_FILE) as f:
             f.write(json.dumps(record) + "\n")
     except OSError as e:
         log(f"  [archive error] {e}")
@@ -662,7 +776,7 @@ def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
         send_telegram(
             "🚨 *FareMonkey: SerpAPI searches exhausted*\n"
             f"Could not check *{_esc_md(label)}* — your SerpAPI plan appears to be out of "
-            f"searches.\n`{(message or '').strip()[:300]}`"
+            f"searches.\n`{(message or '').replace('`', "'").strip()[:300]}`"
         )
     return True
 
@@ -970,17 +1084,20 @@ def format_telegram(route: dict, offer: dict, icon: str,
             arrow = "↓" if pct_change < 0 else "↑"
             price_str += f" ({arrow}{abs(pct_change):.1f}%)"
     parts = [price_str]
+    # Airline names, price_level, layover IDs and flight times come from the
+    # SerpAPI response, not routes.json, but they're still external text going
+    # into a Markdown message — escape them like the route fields.
     level = offer.get("price_level")
     if level:
-        parts.append(f"{level} vs typical")
-    airlines = ", ".join(offer.get("airlines") or []) or "?"
+        parts.append(f"{_esc_md(level)} vs typical")
+    airlines = ", ".join(_esc_md(a) for a in offer.get("airlines") or []) or "?"
     parts.append(airlines)
     stops = offer.get("stops", 0)
     layovers = offer.get("layover_airports") or []
     if stops == 0:
         parts.append("nonstop")
     elif layovers:
-        parts.append(f"{stops} stop {'→'.join(layovers)}")
+        parts.append(f"{stops} stop {'→'.join(_esc_md(lo) for lo in layovers)}")
     else:
         parts.append(f"{stops} stop{'s' if stops > 1 else ''}")
     dur = offer.get("total_duration")
@@ -994,12 +1111,12 @@ def format_telegram(route: dict, offer: dict, icon: str,
         # times and prices, not just the route definition's dates.
         leg_lines = []
         for i, leg in enumerate(offer.get("legs") or []):
-            date_str = _format_date(str(leg.get("date", "")))
+            date_str = _esc_md(_format_date(str(leg.get("date", ""))))
             dep_raw = leg.get("departure_time")
             arr_raw = leg.get("arrival_time")
             if dep_raw and arr_raw:
                 plus = _overnight(dep_raw, arr_raw)
-                times = f"{dep_raw[11:]} → {arr_raw[11:]}{plus}"
+                times = f"{_esc_md(dep_raw[11:])} → {_esc_md(arr_raw[11:])}{plus}"
             else:
                 times = "flight times not available"
             leg_dur = leg.get("total_duration")
@@ -1016,9 +1133,9 @@ def format_telegram(route: dict, offer: dict, icon: str,
     dep_raw = offer.get("departure_time")
     arr_raw = offer.get("arrival_time")
     if dep_raw and arr_raw:
-        dep_date = _format_date(dep_raw[:10])
-        dep_time = dep_raw[11:]
-        arr_time = arr_raw[11:]
+        dep_date = _esc_md(_format_date(dep_raw[:10]))
+        dep_time = _esc_md(dep_raw[11:])
+        arr_time = _esc_md(arr_raw[11:])
         plus = _overnight(dep_raw, arr_raw)
         outbound = f"Outbound: {dep_date} | {dep_time} → {arr_time}{plus}"
     else:
@@ -1027,7 +1144,7 @@ def format_telegram(route: dict, offer: dict, icon: str,
     # Inbound (return date is known but flight times require a second search)
     ret_date = route.get("return_date")
     if ret_date:
-        inbound = f"Inbound: {_format_date(ret_date)} | flight times not available"
+        inbound = f"Inbound: {_esc_md(_format_date(ret_date))} | flight times not available"
     else:
         inbound = None
 
@@ -1093,7 +1210,8 @@ def run_scan(days: int) -> None:
     sync_and_persist_account_quota()
     routes = load_routes()
 
-    with state_lock():
+    with state_lock() as waited:
+        resync_usage_if_waited(waited)
         state = load_json(STATE_FILE)
         offsets = list(range(-days, days + 1))
         needed = sum(route_search_cost(r) for r in routes) * len(offsets)
@@ -1123,7 +1241,8 @@ def run_scan(days: int) -> None:
             try:
                 if is_legs:
                     legs = route.get("legs") or []
-                    anchor = datetime.strptime(legs[0]["date"], "%Y-%m-%d").date()
+                    leg_dates = [datetime.strptime(leg["date"], "%Y-%m-%d").date() for leg in legs]
+                    anchor = leg_dates[0]
                 else:
                     base_dep = datetime.strptime(route["departure_date"], "%Y-%m-%d").date()
                     base_ret = (
@@ -1149,14 +1268,8 @@ def run_scan(days: int) -> None:
                     # gaps between legs — the multi-leg equivalent of shifting
                     # return_date alongside departure_date for a round trip.
                     probe["legs"] = [
-                        {
-                            **leg,
-                            "date": (
-                                datetime.strptime(leg["date"], "%Y-%m-%d").date()
-                                + timedelta(days=off)
-                            ).isoformat(),
-                        }
-                        for leg in legs
+                        {**leg, "date": (leg_date + timedelta(days=off)).isoformat()}
+                        for leg, leg_date in zip(legs, leg_dates)
                     ]
                     date_key = probe["legs"][0]["date"]
                 else:
@@ -1292,7 +1405,8 @@ def main() -> None:
         )
         return
 
-    with state_lock():
+    with state_lock() as waited:
+        resync_usage_if_waited(waited)
         state = load_json(STATE_FILE)
 
         # 1 search call per simple route, N per N-leg multi-leg route (SerpAPI uses
@@ -1390,7 +1504,13 @@ def main() -> None:
 
         # Keep the dataset bounded: prune history, archived responses, and log lines
         # past the retention window every run so local files don't grow forever.
-        hist_removed, resp_removed, log_removed = trim_old_data(state, RETENTION_DAYS)
+        # Housekeeping only — a failure here (full disk, unreadable archive) must
+        # not stop this run's already-paid-for prices from being saved below.
+        try:
+            hist_removed, resp_removed, log_removed = trim_old_data(state, RETENTION_DAYS)
+        except Exception as e:
+            log(f"Trim failed (prices are still saved): {e}")
+            hist_removed = resp_removed = log_removed = 0
         save_json(STATE_FILE, state)
     if hist_removed or resp_removed or log_removed:
         log(

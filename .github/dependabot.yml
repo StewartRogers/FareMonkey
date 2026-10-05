@@ -1,0 +1,8 @@
+# Actions are pinned to full commit SHAs (a moved tag can't swap in different
+# code); Dependabot keeps those pins current.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

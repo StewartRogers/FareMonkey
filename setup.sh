@@ -90,53 +90,14 @@ fi
 echo
 echo "Checking Python dependencies from requirements.txt ..."
 
-deps_satisfied() {
-    "$VENV_PY" - <<'EOF'
-import importlib.metadata as m
-import re
-import sys
-import zoneinfo
-
-ok = True
-with open("requirements.txt") as f:
-    for line in f:
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        name = re.match(r"[A-Za-z0-9_.\-]+", line).group(0)
-        try:
-            m.version(name)
-            continue
-        except m.PackageNotFoundError:
-            pass
-        if name == "tzdata":
-            # The PyPI tzdata package is only a fallback for platforms without
-            # an OS-level IANA timezone database (e.g. Windows, slim containers).
-            # If zoneinfo can already resolve a real zone, the system has one.
-            try:
-                zoneinfo.ZoneInfo("America/New_York")
-                continue
-            except zoneinfo.ZoneInfoNotFoundError:
-                pass
-        print(f"missing: {name}")
-        ok = False
-sys.exit(0 if ok else 1)
-EOF
-}
-
-DEPS_CHECK_TMP="$(mktemp)"
-if deps_satisfied >"$DEPS_CHECK_TMP" 2>&1; then
-    ok "Python dependencies already satisfy requirements.txt — nothing to install"
-    rm -f "$DEPS_CHECK_TMP"
+# Always upgrade (eagerly, so transitive dependencies like urllib3 too) within
+# requirements.txt's ranges: re-running setup is how security fixes get picked
+# up, and a "package is present" check alone would never apply them.
+if "$VENV_PY" -m pip install --quiet --upgrade --upgrade-strategy eager -r requirements.txt; then
+    ok "Python dependencies installed/updated in $VENV_DIR"
 else
-    cat "$DEPS_CHECK_TMP"
-    rm -f "$DEPS_CHECK_TMP"
-    if "$VENV_PY" -m pip install -r requirements.txt; then
-        ok "Python dependencies installed into $VENV_DIR"
-    else
-        fail "pip install failed"
-        exit 1
-    fi
+    fail "pip install failed"
+    exit 1
 fi
 
 # --- Optional dev dependency for the test suite -----------------------------
@@ -157,11 +118,14 @@ fi
 echo
 if [ ! -f .env ]; then
     cp .env.example .env
-    chmod 600 .env
     warn "Created .env from .env.example — edit it and fill in your credentials."
 else
     ok ".env already exists"
 fi
+# .env holds the SerpAPI key and Telegram bot token: owner-only, every run, so an
+# .env created by hand (cp under a default umask is world-readable) gets fixed too.
+chmod 600 .env
+ok ".env permissions set to owner-only (600)"
 
 if [ ! -f routes.json ]; then
     cp routes.example.json routes.json

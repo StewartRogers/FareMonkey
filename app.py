@@ -2,10 +2,13 @@
 """FareMonkey – Flask dashboard for flight price history."""
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
 import re
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -13,14 +16,14 @@ import zoneinfo
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, abort, jsonify, render_template, request
 
 # route_label()/route_search_cost() must stay identical to flight_monitor.py's
 # versions — they derive the exact state.json keys the monitor writes and the
 # dashboard reads, and the real per-route SerpAPI cost the schedule page and
 # MONTHLY_CALL_CAP pre-checks rely on. Import rather than re-implement so the
 # two processes can't silently drift out of sync.
-from flight_monitor import _is_legs_route, route_label, route_search_cost, state_lock  # noqa: F401
+from flight_monitor import _is_iso_date, _is_legs_route, route_label, route_search_cost, state_lock  # noqa: F401
 
 try:
     from dotenv import load_dotenv
@@ -35,6 +38,67 @@ app = Flask(__name__)
 # arbitrarily large body into memory before validation even runs.
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024  # 1 MB
 
+# Host names (besides any IP address) the dashboard answers to. Without this
+# check a malicious website can DNS-rebind its own domain to this machine's LAN
+# address and then drive the whole API from the user's browser as if it were
+# same-origin. An IP literal can't be rebound, so any IP is accepted; add other
+# names (a reverse proxy's, a custom DNS entry) via ALLOWED_HOSTS.
+_HOSTNAME = socket.gethostname().lower()
+ALLOWED_HOSTS = {"localhost", _HOSTNAME, f"{_HOSTNAME}.local"} | {
+    h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+
+
+def _host_name(host: str) -> str:
+    """Strip the port from a Host header value ("[::1]:5000" → "::1")."""
+    host = host.strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    if host.count(":") == 1:
+        return host.split(":", 1)[0]
+    return host
+
+
+def _host_allowed(host: str) -> bool:
+    name = _host_name(host)
+    if name in ALLOWED_HOSTS:
+        return True
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+@app.before_request
+def _reject_foreign_requests():
+    if not _host_allowed(request.host):
+        abort(400, description="Unrecognized Host header (set ALLOWED_HOSTS to add one).")
+    # The state-changing endpoints have no auth (trusted-LAN design), so stop
+    # other websites from triggering them through the user's browser (CSRF):
+    # browsers send Origin on every cross-site POST/DELETE, and Sec-Fetch-Site
+    # where Origin is absent. Clients that send neither (curl, tests) are fine.
+    if request.method not in ("GET", "HEAD", "OPTIONS"):
+        origin = request.headers.get("Origin")
+        if origin is not None:
+            # Origin is "scheme://host[:port]" (or "null"); same-origin means its
+            # host[:port] is exactly the Host this request was sent to.
+            if origin.split("://", 1)[-1].lower() != request.host.lower():
+                abort(403, description="Cross-origin request refused.")
+        elif request.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+            abort(403, description="Cross-origin request refused.")
+
+
+@app.after_request
+def _security_headers(response):
+    # Refuse to be framed, so another site can't overlay the Publish/Delete
+    # buttons and trick a click (clickjacking).
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    return response
+
 BASE_DIR = Path(__file__).parent
 STATE_FILE = BASE_DIR / "state.json"
 ROUTES_FILE = BASE_DIR / "routes.json"
@@ -45,9 +109,14 @@ TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 TRAVEL_CLASSES = ("ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST")
 REQUIRED_ROUTE_FIELDS = ("origin", "destination", "departure_date")
 REQUIRED_LEG_FIELDS = ("origin", "destination", "date")
-IATA_RE = re.compile(r"^[A-Z]{3}$")
-DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-TIME_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
+# Used with fullmatch(): a plain match() with "$" also accepts a trailing "\n".
+IATA_RE = re.compile(r"[A-Z]{3}")
+TIME_RE = re.compile(r"([01]?\d|2[0-3]):([0-5]\d)")
+# Google Flights caps a booking at 9 passengers.
+MAX_PASSENGERS = 9
+# More than enough for any sane schedule; stops a route (or a forged request)
+# from asking for a firing every minute and burning the month's searches.
+MAX_RUN_TIMES = 24
 
 # Used only when no route declares a run_time and the host has no FareMonkey
 # crontab block yet — the schedule documented in README/CLAUDE.md.
@@ -75,11 +144,33 @@ def save_json_atomic(path: Path, data) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
+            # allow_nan=False: NaN/Infinity aren't JSON, and writing them would
+            # leave a file the routes editor's JSON.parse can't read back.
+            json.dump(data, f, indent=2, allow_nan=False)
         os.replace(tmp, path)
     except BaseException:
         os.unlink(tmp)
         raise
+
+
+def _is_int(value) -> bool:
+    # bool is an int subclass, but `"adults": true` is a typo, not a count.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _as_int(value) -> int:
+    """int() for a JSON number or numeric string; rejects bools and fractions."""
+    if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
+        raise ValueError
+    return int(value)
+
+
+def _is_iata(value) -> bool:
+    return isinstance(value, str) and bool(IATA_RE.fullmatch(value.strip().upper()))
+
+
+def _is_time(value) -> bool:
+    return isinstance(value, str) and bool(TIME_RE.fullmatch(value.strip()))
 
 
 def validate_routes(routes) -> list[str]:
@@ -92,13 +183,11 @@ def validate_routes(routes) -> list[str]:
             errors.append(f"Route {i + 1}: must be an object")
             continue
         if "legs" in route:
-            # Multi-leg (multi-city) route: validation here is deliberately loose (no
-            # IATA/date format check per leg, unlike the simple-route fields below) so
-            # a hand-edited routes.json keeps working — just enough to keep an
-            # obviously-malformed entry from being silently saved. The /routes editor
-            # itself uppercases/shapes each leg client-side before posting, and now
-            # escapes every field before re-rendering it, so a leg value that fails
-            # this loose check still can't inject HTML into that page.
+            conflicting = [f for f in REQUIRED_ROUTE_FIELDS + ("return_date",) if route.get(f)]
+            if conflicting:
+                errors.append(
+                    f"Route {i + 1}: a multi-leg route can't also set {', '.join(conflicting)}"
+                )
             legs = route.get("legs")
             if not isinstance(legs, list) or len(legs) < 2:
                 errors.append(f"Route {i + 1}: 'legs' must be a list of at least 2 legs")
@@ -117,34 +206,47 @@ def validate_routes(routes) -> list[str]:
                             f"Route {i + 1} leg {j + 1}: missing required field(s): "
                             f"{', '.join(missing)}"
                         )
+                        continue
+                    for field in ("origin", "destination"):
+                        if not _is_iata(leg[field]):
+                            errors.append(f"Route {i + 1} leg {j + 1}: {field} must be a 3-letter IATA code")
+                    if not _is_iso_date(leg["date"].strip()):
+                        errors.append(f"Route {i + 1} leg {j + 1}: date must be an ISO date (YYYY-MM-DD)")
         else:
             for field in REQUIRED_ROUTE_FIELDS:
                 if not route.get(field):
                     errors.append(f"Route {i + 1}: missing required field '{field}'")
             origin = route.get("origin")
-            if origin and not IATA_RE.match(str(origin).upper()):
+            if origin and not _is_iata(origin):
                 errors.append(f"Route {i + 1}: origin must be a 3-letter IATA code")
             destination = route.get("destination")
-            if destination and not IATA_RE.match(str(destination).upper()):
+            if destination and not _is_iata(destination):
                 errors.append(f"Route {i + 1}: destination must be a 3-letter IATA code")
             for date_field in ("departure_date", "return_date"):
                 value = route.get(date_field)
-                if value and not DATE_RE.match(str(value)):
+                if value and not _is_iso_date(value):
                     errors.append(f"Route {i + 1}: {date_field} must be an ISO date (YYYY-MM-DD)")
+        adults = teens = None
         if "adults" in route and route["adults"] not in (None, ""):
             try:
-                if int(route["adults"]) < 1:
+                adults = _as_int(route["adults"])
+                if adults < 1:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"Route {i + 1}: adults must be a positive integer")
         if "teens" in route and route["teens"] not in (None, ""):
             try:
-                if int(route["teens"]) < 0:
+                teens = _as_int(route["teens"])
+                if teens < 0:
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"Route {i + 1}: teens must be a non-negative integer")
+        if (adults if adults is not None else 1) + (teens or 0) > MAX_PASSENGERS:
+            errors.append(f"Route {i + 1}: at most {MAX_PASSENGERS} passengers (adults + teens)")
         if "max_duration_hours" in route and route["max_duration_hours"] not in (None, ""):
             try:
+                if isinstance(route["max_duration_hours"], bool):
+                    raise ValueError
                 duration = float(route["max_duration_hours"])
                 if not math.isfinite(duration) or duration <= 0:
                     raise ValueError
@@ -157,18 +259,32 @@ def validate_routes(routes) -> list[str]:
             errors.append(f"Route {i + 1}: travel_class must be one of {', '.join(TRAVEL_CLASSES)}")
         run_times = route.get("run_times")
         if run_times not in (None, "", []):
-            if not isinstance(run_times, list) or not all(
-                isinstance(t, str) and TIME_RE.match(t.strip()) for t in run_times
-            ):
+            if not isinstance(run_times, list) or not all(_is_time(t) for t in run_times):
                 errors.append(
                     f"Route {i + 1}: run_times must be a list of 24h \"HH:MM\" times"
                 )
+            elif len({normalize_time(t) for t in run_times}) > MAX_RUN_TIMES:
+                errors.append(f"Route {i + 1}: at most {MAX_RUN_TIMES} run_times per route")
         run_hours = route.get("run_hours")
         if run_hours not in (None, ""):
             if not isinstance(run_hours, list) or not all(
-                isinstance(h, int) and 0 <= h <= 23 for h in run_hours
+                _is_int(h) and 0 <= h <= 23 for h in run_hours
             ):
                 errors.append(f"Route {i + 1}: run_hours must be a list of hours (0-23)")
+    if not errors:
+        # state.json keys each route's prices by route_label(), which omits
+        # return_date/class/passengers — two routes sharing a label would
+        # overwrite each other's history (flight_monitor.load_routes() refuses
+        # such a file, so saving one would stop every scheduled check).
+        labels = [route_label(normalize_route(r)) for r in routes]
+        dupes = sorted({label for label in labels if labels.count(label) > 1})
+        if dupes:
+            errors.append(
+                "Two or more routes share the label "
+                + ", ".join(repr(d) for d in dupes)
+                + " — each route needs a distinct origin/destination/departure date "
+                "(or leg chain) so their price histories don't overwrite each other."
+            )
     return errors
 
 
@@ -194,23 +310,28 @@ def outside_active_hours(times) -> list[str]:
 def normalize_route(route: dict) -> dict:
     """Coerce a validated route dict into the canonical shape/types for routes.json."""
     if "legs" in route:
-        # The /routes editor already uppercases/shapes each leg client-side
-        # before posting — pass legs through as given rather than re-validating
-        # per-leg IATA/date formatting server-side (kept loose, like the rest
-        # of this legs branch, since routes.json can also be hand-edited).
-        out = {"legs": route.get("legs")}
+        # Rebuild each leg from just the fields the monitor uses, so unknown or
+        # nested keys in a posted leg never reach routes.json.
+        out = {"legs": [
+            {
+                "origin": leg["origin"].strip().upper(),
+                "destination": leg["destination"].strip().upper(),
+                "date": leg["date"].strip(),
+            }
+            for leg in route["legs"]
+        ]}
     else:
         out = {
-            "origin": str(route["origin"]).upper(),
-            "destination": str(route["destination"]).upper(),
+            "origin": str(route["origin"]).strip().upper(),
+            "destination": str(route["destination"]).strip().upper(),
             "departure_date": route["departure_date"],
         }
         if route.get("return_date"):
             out["return_date"] = route["return_date"]
     if route.get("adults") not in (None, ""):
-        out["adults"] = int(route["adults"])
+        out["adults"] = _as_int(route["adults"])
     if route.get("teens") not in (None, ""):
-        out["teens"] = int(route["teens"])
+        out["teens"] = _as_int(route["teens"])
     if route.get("max_duration_hours") not in (None, ""):
         out["max_duration_hours"] = float(route["max_duration_hours"])
     if "non_stop" in route:
@@ -402,10 +523,7 @@ def route_times(route: dict) -> list[str]:
     """The clock times a route declares, normalized. Empty means 'every firing'."""
     times = route.get("run_times")
     if isinstance(times, list):
-        return sorted({
-            normalize_time(t) for t in times
-            if isinstance(t, str) and TIME_RE.match(t.strip())
-        })
+        return sorted({normalize_time(t) for t in times if _is_time(t)})
     # A legacy run_hours route declares no times: that field can only filter
     # firings, never create one, so it contributes nothing to the union.
     return []
@@ -510,10 +628,22 @@ def schedule_plan(routes=None) -> dict:
     }
 
 
-def read_crontab() -> str:
-    result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+def read_crontab() -> str | None:
+    """The user's crontab, "" if they have none, or None if it can't be read.
+
+    Only crontab's own "no crontab for <user>" counts as empty. Any other
+    failure (no crontab binary, a permissions problem) returns None, so that
+    publishing refuses instead of installing a crontab that would silently
+    drop every other job the user has.
+    """
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except OSError:
+        return None
     if result.returncode != 0:
-        return ""  # no crontab installed for this user yet
+        if "no crontab for" in result.stderr.lower():
+            return ""
+        return None
     return result.stdout
 
 
@@ -531,7 +661,7 @@ def _expand_cron_field(field: str) -> list[int] | None:
 
 def current_schedule() -> list[str]:
     """Extract HH:MM times from the FareMonkey-managed crontab block, if any."""
-    body = read_crontab()
+    body = read_crontab() or ""
     if CRON_BEGIN not in body:
         return []
     block = body.split(CRON_BEGIN, 1)[1].split(CRON_END, 1)[0]
@@ -555,21 +685,32 @@ def current_schedule() -> list[str]:
     return sorted(set(times))
 
 
+def _cron_arg(path) -> str:
+    """Quote a path for the cron command's shell; cron itself turns an
+    unescaped % into a newline, so that needs escaping on top."""
+    return shlex.quote(str(path)).replace("%", "\\%")
+
+
 def build_cron_block(times: list[str]) -> str:
-    python = sys.executable
+    command = (
+        f"cd {_cron_arg(BASE_DIR)} && {_cron_arg(sys.executable)} {_cron_arg(MONITOR_SCRIPT)} "
+        ">> /dev/null 2>&1"
+    )
     lines = [CRON_BEGIN]
     for t in sorted(set(times)):
         hour, minute = t.split(":")
-        lines.append(
-            f"{int(minute)} {int(hour)} * * * cd {BASE_DIR} && {python} {MONITOR_SCRIPT} "
-            f">> /dev/null 2>&1"
-        )
+        lines.append(f"{int(minute)} {int(hour)} * * * {command}")
     lines.append(CRON_END)
     return "\n".join(lines)
 
 
 def publish_schedule(times: list[str]) -> None:
     existing = read_crontab()
+    if existing is None:
+        raise RuntimeError(
+            "Couldn't read the current crontab (is cron installed?), so publishing "
+            "was refused rather than risk replacing your other cron jobs."
+        )
     if CRON_BEGIN in existing and CRON_END not in existing:
         # Already-malformed crontab (truncated FareMonkey block) — refuse
         # rather than append a second, well-formed block after the broken one.
@@ -628,9 +769,20 @@ def api_schedule_publish():
     the only thing this endpoint decides is whether the derived schedule is safe
     to install.
     """
+    # The page sends an empty JSON body. Requiring the JSON content type means a
+    # cross-site HTML form can't trigger this (it can only send form/plain-text
+    # bodies), on top of the Origin check in _reject_foreign_requests().
+    if not request.is_json:
+        return jsonify({"errors": ["Request must be JSON (Content-Type: application/json)"]}), 415
     plan = schedule_plan()
     if not plan["times"]:
         return jsonify({"errors": ["No run times to publish — give at least one route a run time."]}), 400
+    if plan["searches_per_month"] > plan["monthly_cap"]:
+        return jsonify({"errors": [
+            f"Refusing to publish: this schedule needs about {plan['searches_per_month']} "
+            f"searches/month, over the {plan['monthly_cap']} MONTHLY_CALL_CAP. Remove some "
+            "run times or routes first."
+        ]}), 400
     if plan["outside_active_hours"]:
         return jsonify({"errors": [
             "Refusing to publish: "
@@ -673,7 +825,11 @@ def _free_port(host: str) -> int:
 
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG", "false").lower() in ("1", "true", "yes")
-    host = "0.0.0.0"
+    # The Werkzeug debugger runs arbitrary code for whoever can reach it, so
+    # debug mode is never exposed to the network, only to this machine.
+    host = "127.0.0.1" if debug else "0.0.0.0"
+    if debug:
+        print("FLASK_DEBUG is on: listening on 127.0.0.1 only (this machine).")
     requested_port = int(os.environ.get("PORT", "5000"))
     port = requested_port
     if not _port_available(host, port):
