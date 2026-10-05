@@ -683,7 +683,7 @@ class TestApiSchedule:
             {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15",
              "run_times": ["05:00"]},
         ]))
-        resp = client.post("/api/schedule")
+        resp = client.post("/api/schedule", json={})
         assert resp.status_code == 400
         assert "05:00" in resp.get_json()["errors"][0]
 
@@ -696,7 +696,7 @@ class TestApiSchedule:
         monkeypatch.setattr(
             webapp, "publish_schedule", lambda times: installed.append(list(times))
         )
-        body = client.post("/api/schedule").get_json()
+        body = client.post("/api/schedule", json={}).get_json()
         assert installed == [["07:30", "19:30"]]
         assert body["ok"] is True
         assert body["in_sync"] is True
@@ -715,7 +715,7 @@ class TestApiSchedule:
             return mock.Mock(returncode=0, stderr="")
 
         monkeypatch.setattr(webapp.subprocess, "run", fake_run)
-        resp = client.post("/api/schedule")
+        resp = client.post("/api/schedule", json={})
         assert resp.status_code == 200
         assert resp.get_json()["times"] == ["07:30", "13:30", "19:30"]
 
@@ -735,7 +735,7 @@ class TestApiSchedule:
             return mock.Mock(returncode=1, stderr="permission denied")
 
         monkeypatch.setattr(webapp.subprocess, "run", fake_run)
-        resp = client.post("/api/schedule")
+        resp = client.post("/api/schedule", json={})
         assert resp.status_code == 500
         assert "permission denied" in resp.get_json()["errors"][0]
 
@@ -795,3 +795,139 @@ class TestPortHelpers:
             s.listen(1)
             port = s.getsockname()[1]
             assert webapp._port_available("127.0.0.1", port) is False
+
+
+# ---------------------------------------------------------------------------
+# Security hardening: Host/Origin checks, headers, stricter validation,
+# budget refusal, crontab read failures, cron quoting
+# ---------------------------------------------------------------------------
+
+SIMPLE = {"origin": "YVR", "destination": "FRA", "departure_date": "2027-03-15"}
+
+
+class TestRequestChecks:
+    def test_unknown_host_is_rejected(self, client, state_file):
+        # DNS rebinding: an attacker's domain pointed at this machine.
+        assert client.get("/api/state", headers={"Host": "evil.example:5000"}).status_code == 400
+
+    @pytest.mark.parametrize("host", ["localhost:5000", "127.0.0.1:5000", "192.168.1.20:5000", "[::1]:5000"])
+    def test_local_and_ip_hosts_are_allowed(self, client, state_file, host):
+        assert client.get("/api/state", headers={"Host": host}).status_code == 200
+
+    def test_allowed_hosts_env_extends_the_list(self, client, state_file, monkeypatch):
+        monkeypatch.setattr(webapp, "ALLOWED_HOSTS", webapp.ALLOWED_HOSTS | {"pi.example.lan"})
+        assert client.get("/api/state", headers={"Host": "pi.example.lan"}).status_code == 200
+
+    def test_cross_origin_post_is_refused(self, client, routes_file):
+        resp = client.post("/api/routes", json=[SIMPLE], headers={"Origin": "https://evil.example"})
+        assert resp.status_code == 403
+        assert not routes_file.exists()
+
+    def test_same_origin_post_is_allowed(self, client, routes_file):
+        resp = client.post("/api/routes", json=[SIMPLE], headers={"Origin": "http://localhost"})
+        assert resp.status_code == 200
+
+    def test_cross_site_fetch_metadata_is_refused(self, client, state_file):
+        resp = client.delete("/api/routes/x", headers={"Sec-Fetch-Site": "cross-site"})
+        assert resp.status_code == 403
+
+    def test_form_post_to_schedule_is_refused(self, client, routes_file):
+        routes_file.write_text(json.dumps([{**SIMPLE, "run_times": ["07:30"]}]))
+        resp = client.post("/api/schedule", data={"x": "1"})
+        assert resp.status_code == 415
+
+    def test_security_headers(self, client, state_file):
+        resp = client.get("/")
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert "frame-ancestors 'none'" in resp.headers["Content-Security-Policy"]
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+
+
+class TestStricterValidation:
+    @pytest.mark.parametrize("route", [
+        {**SIMPLE, "departure_date": "2027-03-15\n"},
+        {**SIMPLE, "departure_date": "2027-13-45"},
+        {**SIMPLE, "adults": True},
+        {**SIMPLE, "adults": 1.5},
+        {**SIMPLE, "adults": 8, "teens": 2},
+        {**SIMPLE, "run_hours": [True]},
+        {**SIMPLE, "run_times": [f"{h:02d}:{m:02d}" for h in range(7, 10) for m in range(0, 60, 5)]},
+        {"legs": [{"origin": "Y" * 50, "destination": "HEL", "date": "2027-03-15"},
+                  {"origin": "HEL", "destination": "YVR", "date": "2027-03-20"}]},
+        {"legs": [{"origin": "YVR", "destination": "HEL", "date": "nope"},
+                  {"origin": "HEL", "destination": "YVR", "date": "2027-03-20"}]},
+        {**SIMPLE, "legs": [{"origin": "YVR", "destination": "HEL", "date": "2027-03-15"},
+                            {"origin": "HEL", "destination": "YVR", "date": "2027-03-20"}]},
+    ])
+    def test_rejected(self, route):
+        assert webapp.validate_routes([route])
+
+    def test_padded_iata_is_saved_trimmed(self):
+        route = {**SIMPLE, "origin": "yvr\n"}
+        assert webapp.validate_routes([route]) == []
+        assert webapp.normalize_route(route)["origin"] == "YVR"
+
+    def test_duplicate_labels_rejected(self):
+        errors = webapp.validate_routes([SIMPLE, {**SIMPLE, "travel_class": "BUSINESS"}])
+        assert any("share the label" in e for e in errors)
+
+    def test_legs_normalized_to_known_fields(self):
+        route = {"legs": [
+            {"origin": "yvr", "destination": "hel", "date": "2027-03-15", "x": float("nan")},
+            {"origin": "HEL", "destination": "YVR", "date": "2027-03-20", "nested": {"a": 1}},
+        ]}
+        assert webapp.validate_routes([route]) == []
+        assert webapp.normalize_route(route)["legs"] == [
+            {"origin": "YVR", "destination": "HEL", "date": "2027-03-15"},
+            {"origin": "HEL", "destination": "YVR", "date": "2027-03-20"},
+        ]
+
+
+class TestPublishSafety:
+    def test_over_cap_schedule_is_refused(self, client, routes_file, monkeypatch):
+        monkeypatch.setenv("MONTHLY_CALL_CAP", "60")  # 3 times/day × 30 = 90 > 60
+        routes_file.write_text(json.dumps([{**SIMPLE, "run_times": ["07:30", "13:30", "19:30"]}]))
+        with mock.patch.object(webapp, "publish_schedule") as publish:
+            resp = client.post("/api/schedule", json={})
+        assert resp.status_code == 400
+        assert "MONTHLY_CALL_CAP" in resp.get_json()["errors"][0]
+        publish.assert_not_called()
+
+    def test_unreadable_crontab_refuses_publish(self, monkeypatch):
+        monkeypatch.setattr(webapp, "read_crontab", lambda: None)
+        with mock.patch.object(webapp.subprocess, "run") as run:
+            with pytest.raises(RuntimeError, match="Couldn't read the current crontab"):
+                webapp.publish_schedule(["07:30"])
+        run.assert_not_called()
+
+
+class TestReadCrontab:
+    # These call the real read_crontab (saved before the autouse stub replaces it).
+    real = staticmethod(webapp.read_crontab)
+
+    def test_no_crontab_is_empty(self, monkeypatch):
+        monkeypatch.setattr(webapp.subprocess, "run", lambda *a, **k: mock.Mock(
+            returncode=1, stdout="", stderr="no crontab for pi"))
+        assert self.real() == ""
+
+    def test_other_failure_is_none(self, monkeypatch):
+        monkeypatch.setattr(webapp.subprocess, "run", lambda *a, **k: mock.Mock(
+            returncode=1, stdout="", stderr="crontab: Permission denied"))
+        assert self.real() is None
+
+    def test_missing_binary_is_none(self, monkeypatch):
+        def boom(*a, **k):
+            raise FileNotFoundError("crontab")
+        monkeypatch.setattr(webapp.subprocess, "run", boom)
+        assert self.real() is None
+
+    def test_missing_binary_does_not_break_schedule_page(self, client, routes_file, monkeypatch):
+        monkeypatch.setattr(webapp, "read_crontab", lambda: None)
+        assert client.get("/api/schedule").status_code == 200
+
+
+class TestCronQuoting:
+    def test_paths_are_shell_quoted_and_percent_escaped(self, monkeypatch):
+        monkeypatch.setattr(webapp, "BASE_DIR", Path("/home/pi/my files/100%"))
+        block = webapp.build_cron_block(["07:30"])
+        assert "cd '/home/pi/my files/100\\%' &&" in block

@@ -169,7 +169,11 @@
       statusEl.textContent = 'Publishing...';
       statusEl.className = 'status';
       try {
-        const resp = await fetch('/api/schedule', { method: 'POST' });
+        const resp = await fetch('/api/schedule', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: '{}',
+        });
         const data = await resp.json();
         if (!resp.ok) {
           statusEl.textContent = (data.errors || ['Publish failed']).join('\n');

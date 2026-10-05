@@ -1404,3 +1404,159 @@ class TestRunScan:
     def test_simple_route_call_count_is_one_per_offset(self, state_file):
         _, state = self._run(self.SIMPLE_ROUTE, 1, state_file)
         assert fm.get_call_count(state) == 3
+
+
+# ---------------------------------------------------------------------------
+# Security hardening: secret redaction, file modes, route validation, quota
+# re-sync, trim isolation, Markdown escaping of API text
+# ---------------------------------------------------------------------------
+
+class TestRedaction:
+    def test_serpapi_key_in_url_is_redacted(self, log_file):
+        fm.log("Account sync failed: ... url: /account.json?api_key=abc123def&x=1 (Caused by ...)")
+        text = log_file.read_text(encoding="utf-8")
+        assert "abc123def" not in text
+        assert "api_key=***&x=1" in text
+
+    def test_telegram_token_in_url_is_redacted(self, log_file):
+        fm.log("[Telegram error] ... url: /bot123456:AAH-secret_token/sendMessage (Caused by ...)")
+        text = log_file.read_text(encoding="utf-8")
+        assert "AAH-secret_token" not in text
+        assert "/bot***/sendMessage" in text
+
+    def test_literal_secret_values_are_redacted(self, log_file, capsys):
+        with mock.patch.object(fm, "SERPAPI_API_KEY", "literal-key-value"), \
+             mock.patch.object(fm, "TELEGRAM_BOT_TOKEN", "literal-bot-token"):
+            fm.log("leaked literal-key-value and literal-bot-token")
+        for out in (log_file.read_text(encoding="utf-8"), capsys.readouterr().out):
+            assert "literal-key-value" not in out
+            assert "literal-bot-token" not in out
+
+
+class TestPrivateFileModes:
+    def test_log_file_created_owner_only(self, log_file):
+        fm.log("hello")
+        assert (log_file.stat().st_mode & 0o777) == 0o600
+
+    def test_response_archive_created_owner_only(self, responses_file):
+        with mock.patch.object(fm, "ARCHIVE_RESPONSES", True):
+            fm.archive_response({"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"},
+                                {"api_key": "x"}, {})
+        assert (responses_file.stat().st_mode & 0o777) == 0o600
+
+
+class TestRouteProblems:
+    BASE = {"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"}
+
+    @pytest.mark.parametrize("extra", [
+        {"departure_date": "2026-13-45"},
+        {"return_date": "not-a-date"},
+        {"adults": "2"},
+        {"adults": True},
+        {"teens": -1},
+        {"max_duration_hours": "12"},
+        {"run_times": "07:30"},
+        {"run_times": ["7:30pm"]},
+        {"run_hours": 8},
+    ])
+    def test_bad_values_are_reported(self, extra):
+        assert fm.route_problems({**self.BASE, **extra})
+
+    def test_good_route_has_no_problems(self):
+        route = {**self.BASE, "return_date": "2026-12-30", "adults": 2, "teens": 1,
+                 "max_duration_hours": 12.5, "run_times": ["07:30"]}
+        assert fm.route_problems(route) == []
+
+    def test_bad_later_leg_date_is_reported(self):
+        route = {"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "JFK", "date": "2026-09-xx"},
+        ]}
+        assert any("leg 1" in p for p in fm.route_problems(route))
+
+    def test_non_dict_entry_is_reported(self):
+        assert fm.route_problems("YVR-CUN") == ["must be a JSON object"]
+
+    def test_duplicate_labels_exit(self, tmp_path):
+        path = tmp_path / "routes.json"
+        path.write_text(json.dumps([
+            {**self.BASE, "travel_class": "ECONOMY"},
+            {**self.BASE, "travel_class": "BUSINESS"},
+        ]), encoding="utf-8")
+        with mock.patch.object(fm, "ROUTES_FILE", path):
+            with pytest.raises(SystemExit, match="more than one route"):
+                fm.load_routes()
+
+
+class TestQuotaResync:
+    def test_no_resync_when_lock_was_free(self):
+        with mock.patch.object(fm, "sync_account_quota") as sync, \
+             mock.patch.object(fm, "_this_month_usage", 10):
+            fm.resync_usage_if_waited(False)
+            assert fm._this_month_usage == 10
+        sync.assert_not_called()
+
+    def test_resync_after_waiting_fails_closed(self, log_file):
+        # The refresh fails (sync leaves usage unset), so the stale pre-lock
+        # figure must not survive to approve searches.
+        with mock.patch.object(fm, "sync_account_quota", return_value=None) as sync, \
+             mock.patch.object(fm, "_this_month_usage", 10), \
+             mock.patch.object(fm, "_calls_made_this_run", 0):
+            fm.resync_usage_if_waited(True)
+            assert fm._this_month_usage is None
+            assert fm.can_make_calls(1) is False
+        sync.assert_called_once()
+
+    def test_state_lock_reports_whether_it_waited(self, tmp_path):
+        with mock.patch.object(fm, "STATE_LOCK_FILE", tmp_path / "state.json.lock"):
+            with fm.state_lock() as waited:
+                assert waited is False
+
+
+class TestScanBadLegDate:
+    def test_bad_later_leg_date_skips_only_that_route(self, state_file, log_file):
+        bad = {"legs": [
+            {"origin": "JFK", "destination": "HEL", "date": "2026-09-15"},
+            {"origin": "HEL", "destination": "JFK", "date": "bad"},
+        ]}
+        good = {"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"}
+        with mock.patch.object(fm, "load_routes", return_value=[bad, good]), \
+             mock.patch.object(fm, "sync_and_persist_account_quota"), \
+             mock.patch.object(fm, "can_make_calls", return_value=True), \
+             mock.patch.object(fm, "search_cheapest", return_value={"price": 500.0}) as search, \
+             mock.patch.object(fm, "send_telegram"):
+            fm.run_scan(1)
+        assert search.call_count == 3  # only the good route's 3 offsets
+        assert fm.route_label(good) in fm.load_json(state_file)["flex_scans"]
+
+
+class TestMainSurvivesTrimFailure:
+    def test_prices_saved_even_if_trim_raises(self, state_file, log_file):
+        route = {"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"}
+        with mock.patch.object(fm.sys, "argv", ["flight_monitor.py", "--force"]), \
+             mock.patch.object(fm, "SERPAPI_API_KEY", "k"), \
+             mock.patch.object(fm, "sync_and_persist_account_quota"), \
+             mock.patch.object(fm, "load_routes", return_value=[route]), \
+             mock.patch.object(fm, "can_make_calls", return_value=True), \
+             mock.patch.object(fm, "search_cheapest", return_value={"price": 500.0}), \
+             mock.patch.object(fm, "send_telegram"), \
+             mock.patch.object(fm, "trim_old_data", side_effect=OSError("disk full")):
+            fm.main()
+        assert fm.load_json(state_file)["prices"][fm.route_label(route)]["price"] == 500.0
+
+
+class TestTelegramEscapesApiText:
+    def test_airline_and_level_are_escaped(self):
+        route = {"origin": "YVR", "destination": "CUN", "departure_date": "2026-12-23"}
+        offer = {"price": 500.0, "airlines": ["[Click](http://evil)"], "stops": 1,
+                 "layover_airports": ["S_EA"], "price_level": "*low*"}
+        msg = fm.format_telegram(route, offer, "🐒", None)
+        assert "\\[Click](http://evil)" in msg
+        assert "\\*low\\*" in msg
+        assert "S\\_EA" in msg
+
+    def test_quota_alert_strips_backticks(self):
+        with mock.patch.object(fm, "_QUOTA_ALERTED", False), \
+             mock.patch.object(fm, "send_telegram") as send:
+            fm._maybe_alert_quota("YVR-CUN 2026-12-23", 429, "out of searches `oops`")
+        assert "`oops`" not in send.call_args[0][0]

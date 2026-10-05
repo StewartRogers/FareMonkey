@@ -99,9 +99,11 @@ seeds `.env` and `routes.json`) and is safe to re-run:
 
 ```bash
 cp .env.example .env
+chmod 600 .env   # it holds your API key and bot token
 ```
 
-Edit `.env` with your credentials.
+Edit `.env` with your credentials. (`./setup.sh` creates `.env` and sets this
+permission for you.)
 
 ### 4. Run the dashboard
 
@@ -122,6 +124,17 @@ FLASK_DEBUG=true ./startweb.sh
 > page writes crontab entries using the interpreter the app is running under
 > (`sys.executable`), so launching it with the system Python would install cron
 > lines pointing at an interpreter that has none of the dependencies.
+
+> **No login — trusted networks only.** The dashboard listens on all network
+> interfaces, so anyone on your LAN can open it and use the route editor and
+> Publish button (which rewrites this machine's crontab). Only run it on a network
+> you trust; for anything wider, put it behind a reverse proxy with real
+> authentication. It refuses requests from other websites (cross-origin requests
+> and unknown `Host` names), so a page you browse can't drive it through your
+> browser. If you reach it by a name other than `localhost`, this machine's
+> hostname, or an IP address, add that name to `ALLOWED_HOSTS`.
+> `FLASK_DEBUG=true` makes it listen on `127.0.0.1` only, because the debugger
+> runs arbitrary code for whoever can reach it.
 
 Open `http://localhost:5000` in your browser. The dashboard shows price charts, percentage changes, and API usage stats. It reads from `state.json` on each page load.
 
@@ -249,7 +262,8 @@ Trigger it from the *Actions* tab → *Flight Price Monitor* → *Run workflow*.
 | `ARCHIVE_RESPONSES` | No | `true` | Append every raw API response to `responses.jsonl` |
 | `RETENTION_DAYS` | No | `30` | Prune history and archived responses older than this (each run) |
 | `EXCLUDE_US_CONNECTIONS` | No | `false` | Drop itineraries that connect through a US airport (nonstop and non-US connections kept) |
-| `FLASK_DEBUG` | No | `false` | Enable Flask debug mode for the dashboard (`app.py`) — local development only |
+| `FLASK_DEBUG` | No | `false` | Enable Flask debug mode for the dashboard (`app.py`) — local development only; listens on `127.0.0.1` only while on |
+| `ALLOWED_HOSTS` | No | - | Extra comma-separated host names the dashboard answers to (`localhost`, this machine's hostname and any IP address are always allowed) |
 
 ## SerpAPI account sync & quota alerts
 

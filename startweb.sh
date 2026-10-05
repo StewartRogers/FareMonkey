@@ -28,7 +28,12 @@ if ! "$VENV_PY" -c "import flask" >/dev/null 2>&1; then
 fi
 
 echo "Starting FareMonkey dashboard with $VENV_PY"
-echo "Dashboard will be at http://localhost:${PORT:-5000}  (Ctrl-C to stop)"
+if [[ "${FLASK_DEBUG:-false}" =~ ^(1|true|yes)$ ]]; then
+    echo "Dashboard will be at http://localhost:${PORT:-5000} — debug mode, this machine only  (Ctrl-C to stop)"
+else
+    echo "Dashboard will be at http://localhost:${PORT:-5000} and on this machine's LAN address  (Ctrl-C to stop)"
+    echo "No login: anyone on your network can use it. Only run it on a trusted network."
+fi
 echo
 
 # exec so Ctrl-C / systemd signals reach Python directly instead of this wrapper.
