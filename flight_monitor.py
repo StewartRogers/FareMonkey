@@ -773,10 +773,12 @@ def _maybe_alert_quota(label: str, status: int | None, message: str) -> bool:
         return False
     if not _QUOTA_ALERTED:
         _QUOTA_ALERTED = True
+        # A backtick in the API's text would close the code span early.
+        detail = (message or "").replace("`", "'").strip()[:300]
         send_telegram(
             "🚨 *FareMonkey: SerpAPI searches exhausted*\n"
             f"Could not check *{_esc_md(label)}* — your SerpAPI plan appears to be out of "
-            f"searches.\n`{(message or '').replace('`', "'").strip()[:300]}`"
+            f"searches.\n`{detail}`"
         )
     return True
 

@@ -1361,7 +1361,9 @@ class TestRunScan:
             probes.append(r)
             return {"price": 1000.0}
 
-        with mock.patch.object(fm, "load_routes", return_value=[route]), \
+        # run_scan() exits early without a key; CI has no .env to supply one.
+        with mock.patch.object(fm, "SERPAPI_API_KEY", "test-key"), \
+             mock.patch.object(fm, "load_routes", return_value=[route]), \
              mock.patch.object(fm, "sync_account_quota"), \
              mock.patch.object(fm, "can_make_calls", return_value=True), \
              mock.patch.object(fm, "search_cheapest", side_effect=fake_search), \
@@ -1520,7 +1522,8 @@ class TestScanBadLegDate:
             {"origin": "HEL", "destination": "JFK", "date": "bad"},
         ]}
         good = {"origin": "YVR", "destination": "LIS", "departure_date": "2027-05-10"}
-        with mock.patch.object(fm, "load_routes", return_value=[bad, good]), \
+        with mock.patch.object(fm, "SERPAPI_API_KEY", "test-key"), \
+             mock.patch.object(fm, "load_routes", return_value=[bad, good]), \
              mock.patch.object(fm, "sync_and_persist_account_quota"), \
              mock.patch.object(fm, "can_make_calls", return_value=True), \
              mock.patch.object(fm, "search_cheapest", return_value={"price": 500.0}) as search, \
