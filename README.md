@@ -69,9 +69,10 @@ Fields: `origin` and `destination` are IATA airport codes. `departure_date` is r
 
 ### 3. Install and configure
 
-**Requires Python 3.9–3.13.** Every version in that range is exercised by the
-test matrix in `.github/workflows/tests.yml`, so the same checkout runs unchanged
-on a Raspberry Pi OS bullseye box (3.9) and a current 3.13 system.
+**Requires Python 3.10–3.13.** Every version in that range is exercised by the
+test matrix in `.github/workflows/tests.yml`. Python 3.9 is no longer supported:
+it's end-of-life and can't install the `urllib3` release with current security
+fixes. On Raspberry Pi OS that means bookworm (3.11) or newer — bullseye ships 3.9.
 
 Dependencies go in a project-local virtual environment (`.venv`), never in the
 system Python:
@@ -278,12 +279,14 @@ The pure-logic parts of `flight_monitor.py` (no live API calls) are covered by a
 .venv/bin/python -m pytest tests/
 ```
 
-The same suite runs in CI on Python 3.9, 3.10, 3.11, 3.12, and 3.13
+The same suite runs in CI on Python 3.10, 3.11, 3.12, and 3.13
 (`.github/workflows/tests.yml`) on every push and pull request. It makes no API
 calls and needs no secrets. Note that `requirements.txt` uses open version ranges
 rather than pins on purpose — pip honours each package's `Requires-Python`, so
-Python 3.9 installs the last releases that still support it while 3.13 gets
-current ones. Pinning exact versions would break one end of the range.
+each Python version installs the newest releases it supports. Pinning exact
+versions would break one end of the range. The ranges do carry floors above
+releases with known CVEs, including for a few transitive dependencies
+(`certifi`, `urllib3`, `werkzeug`) listed only for that reason.
 
 ## Data archive & retention
 
@@ -335,7 +338,7 @@ The default `MONTHLY_CALL_CAP=240` leaves a comfortable buffer below a 250-searc
 | `tests/test_flight_monitor.py` | Pytest suite for pure-logic functions (no live API calls) |
 | `tests/test_app.py` | Pytest suite for the Flask dashboard: route validation, the delete endpoint, and cron schedule logic (crontab mocked) |
 | `.github/workflows/monitor.yml` | GitHub Actions workflow (manual-only smoke test; commits no data) |
-| `.github/workflows/tests.yml` | GitHub Actions test matrix across Python 3.9–3.13 (no API calls) |
+| `.github/workflows/tests.yml` | GitHub Actions test matrix across Python 3.10–3.13 (no API calls) |
 
 ## License
 

@@ -14,18 +14,20 @@ echo "================"
 
 missing=0
 
-# --- Python 3.9+ -------------------------------------------------------
+# --- Python 3.10+ ------------------------------------------------------
 if command -v python3 >/dev/null 2>&1; then
     PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-    PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 9) else 0)')
-    # Supported and CI-tested range: 3.9 (Raspberry Pi OS bullseye) through 3.13.
+    PY_OK=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 10) else 0)')
+    # Supported and CI-tested range: 3.10 through 3.13. 3.9 (Raspberry Pi OS
+    # bullseye) is unsupported: it can't install urllib3 >= 2.8, which fixes
+    # High-severity advisories.
     PY_NEW=$(python3 -c 'import sys; print(1 if sys.version_info >= (3, 14) else 0)')
     if [ "$PY_OK" = "1" ] && [ "$PY_NEW" = "0" ]; then
         ok "python3 $PY_VER"
     elif [ "$PY_OK" = "1" ]; then
-        warn "python3 $PY_VER is newer than the tested range (3.9–3.13) — probably fine, but untested"
+        warn "python3 $PY_VER is newer than the tested range (3.10–3.13) — probably fine, but untested"
     else
-        fail "python3 found but is $PY_VER (need 3.9+)"
+        fail "python3 found but is $PY_VER (need 3.10+)"
         missing=1
     fi
 else
