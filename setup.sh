@@ -116,6 +116,23 @@ else
     ok "pytest ($("$VENV_PY" -m pip show pytest | awk '/^Version:/{print $2}'))"
 fi
 
+# --- Optional dev tool for dependency vulnerability audits ------------------
+# pip-audit checks what's installed in the venv against the PyPI/OSV advisory
+# databases. Like pytest it's a dev tool, so it's offered rather than added to
+# requirements.txt (the cron job never needs it).
+if ! "$VENV_PY" -m pip show pip-audit >/dev/null 2>&1; then
+    echo
+    read -r -p "pip-audit is not installed (checks dependencies for known vulnerabilities). Install it now? [y/N] " reply
+    if [[ "$reply" =~ ^[Yy]$ ]]; then
+        "$VENV_PY" -m pip install pip-audit
+        ok "pip-audit installed — run '$VENV_DIR/bin/python -m pip_audit' to audit dependencies"
+    else
+        warn "Skipped — run '$VENV_DIR/bin/pip install pip-audit' later if you want dependency audits."
+    fi
+else
+    ok "pip-audit ($("$VENV_PY" -m pip show pip-audit | awk '/^Version:/{print $2}'))"
+fi
+
 # --- Local config files ------------------------------------------------------
 echo
 if [ ! -f .env ]; then

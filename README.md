@@ -288,6 +288,20 @@ versions would break one end of the range. The ranges do carry floors above
 releases with known CVEs, including for a few transitive dependencies
 (`certifi`, `urllib3`, `werkzeug`) listed only for that reason.
 
+### Auditing dependencies
+
+To check the installed packages for known vulnerabilities, use `pip-audit`
+(`setup.sh` offers to install it, or install it yourself):
+
+```bash
+.venv/bin/pip install pip-audit
+.venv/bin/python -m pip_audit
+```
+
+It audits everything installed in `.venv` against the PyPI/OSV advisory
+databases and changes nothing. Re-running `./setup.sh` is how fixes within
+`requirements.txt`'s ranges get picked up.
+
 ## Data archive & retention
 
 Every raw API response is appended to `responses.jsonl` (one JSON object per line) so the full payload — all offers, `price_insights`, airports, booking tokens — is preserved, even though alerts and the dashboard only surface the single cheapest fare. The API key is stripped from the archived query. Set `ARCHIVE_RESPONSES=false` to turn this off.
